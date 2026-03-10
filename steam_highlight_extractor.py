@@ -355,7 +355,9 @@ def export_clip(session_dir, start_sec, duration, output_path):
         return False
 
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        result = subprocess.run(cmd, capture_output=True, timeout=300,
+                                creationflags=no_window)
         if result.returncode != 0:
             err = result.stderr.decode(errors="replace")
             # Extract the most useful line from the ffmpeg error output
