@@ -1,0 +1,27 @@
+# Output clips
+SteamHighlights/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# ffmpeg binary if bundled
+ffmpeg.exe
+ffprobe.exe
+
+# Generated icon (built from app-icon.png)
+app-icon.ico
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
