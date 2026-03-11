@@ -8,7 +8,7 @@ moments as MP4 clips — no AI frame analysis needed.
 Requirements:
     - ffmpeg on PATH  OR  ffmpeg.exe placed next to this script
       Download: https://ffmpeg.org/download.html
-      Or via winget: winget install ffmpeg
+      Or via winget: winget install Gyan.FFmpeg
 
     - Python 3.9+  (no extra pip packages needed)
 
@@ -103,7 +103,7 @@ def check_ffmpeg():
     print("ERROR: ffmpeg not found.")
     print()
     print("  Install options:")
-    print("    winget install ffmpeg")
+    print("    winget install Gyan.FFmpeg")
     print("    OR download from https://ffmpeg.org/download.html")
     print("    OR place ffmpeg.exe next to this script.")
     print()
@@ -351,7 +351,7 @@ def export_clip(session_dir, start_sec, duration, output_path):
 
     if not FFMPEG_BIN:
         print("    ERROR: ffmpeg is not installed. Cannot export clips.")
-        print("    Run:  winget install ffmpeg")
+        print("    Run:  winget install Gyan.FFmpeg")
         return False
 
     try:
@@ -370,7 +370,7 @@ def export_clip(session_dir, start_sec, duration, output_path):
         print("    WARNING: ffmpeg timed out after 5 minutes. Skipping this clip.")
         return False
     except (FileNotFoundError, TypeError):
-        print("    ERROR: ffmpeg not found. Run:  winget install ffmpeg")
+        print("    ERROR: ffmpeg not found. Run:  winget install Gyan.FFmpeg")
         return False
 
 
@@ -548,7 +548,7 @@ def process_session(session_dir, output_folder, stop_event=None):
         # For kill groups, shift start earlier to capture the shot (not just the death)
         pre_shift = KILL_EVENT_PRE_SHIFT if kill_count > 0 else 0
         clip_start = max(0.0, group["start"] - CLIP_PADDING_BEFORE - pre_shift)
-        clip_end   = group["end"] + CLIP_PADDING_AFTER
+        clip_end   = group["end"] + CLIP_PADDING_AFTER + pre_shift
         clip_duration = clip_end - clip_start
 
         # Build a readable label

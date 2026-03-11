@@ -9,11 +9,12 @@ It reads the timeline data Steam already records alongside your gameplay, finds 
 ## Quick Start
 
 1. **Download** `SteamHighlightExtractor.exe` from the [Releases](../../releases) page
-2. **Install ffmpeg** — open a terminal and run:
-   ```
-   winget install ffmpeg
-   ```
-   Or place `ffmpeg.exe` in the same folder as the exe
+2. **Install ffmpeg** — pick one option:
+   - **Winget** (Windows 10/11): open a terminal and run:
+     ```
+     winget install Gyan.FFmpeg
+     ```
+   - **Direct download**: get a Windows build from [ffmpeg.org](https://ffmpeg.org/download.html) → Windows → "Windows builds from gyan.dev" → download the `ffmpeg-release-essentials.zip`, extract it, and place `ffmpeg.exe` in the same folder as `SteamHighlightExtractor.exe`
 3. **Enable Steam Background Recording**
    Steam → Settings → Game Recording → turn on Background Recording
 4. **Double-click** `SteamHighlightExtractor.exe`
@@ -57,7 +58,7 @@ Use **⏹ Stop** to pause at any time — click **▶ Resume** to continue from 
 ## Requirements
 
 - **Windows 10/11**
-- **ffmpeg** — `winget install ffmpeg` or [ffmpeg.org](https://ffmpeg.org/download.html)
+- **ffmpeg** — `winget install Gyan.FFmpeg` or download from [ffmpeg.org](https://ffmpeg.org/download.html)
 - **Steam Background Recording enabled**
 
 If running from source instead of the exe:
@@ -131,7 +132,8 @@ Currently tested with **Counter-Strike 2 (CS2)**. Any game that writes events to
 - Increase the **Kill pre-shift** setting. CS2 logs kill events at death confirmation, which is 1–3 seconds after the shot lands.
 
 **ffmpeg not found**
-- Run `winget install ffmpeg` in a terminal, or place `ffmpeg.exe` next to the exe
+- Run `winget install Gyan.FFmpeg` in a terminal (use the exact ID — `ffmpeg` alone won't be found)
+- Or place `ffmpeg.exe` directly next to the exe — download from [ffmpeg.org](https://ffmpeg.org/download.html) → Windows → gyan.dev builds → `ffmpeg-release-essentials.zip`
 
 ---
 
