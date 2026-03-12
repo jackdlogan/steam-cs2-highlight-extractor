@@ -1,0 +1,18 @@
+[package]
+name = "steam-highlight-extractor"
+version = "1.2.0"
+description = "Steam Highlight Extractor"
+authors = []
+edition = "2021"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

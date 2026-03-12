@@ -346,7 +346,8 @@ def export_clip(session_dir, start_sec, duration, output_path):
         cmd += ["-vf", vf, "-af", af]
     else:
         cmd += ["-vf", vf, "-an"]
-    cmd += ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-movflags", "+faststart"]
     cmd += [str(output_path)]
 
     if not FFMPEG_BIN:
@@ -387,10 +388,21 @@ def _parse_datetime_from_name(name):
     return None
 
 
-def process_session(session_dir, output_folder, stop_event=None):
+def _is_kill_event(event):
+    label = (event.get("type", "") + " " + event.get("label", "")).lower()
+    return any(kw in label for kw in KILL_EVENTS)
+
+
+def _parse_session_groups(session_dir):
+    """
+    Shared internal: parse a session directory and return (groups, error).
+    groups is a list of raw group dicts with keys:
+        events, start, end, is_multikill, kill_count
+    Returns (None, reason_str) on any error condition.
+    """
     mpd_path = session_dir / "session.mpd"
     if not mpd_path.exists():
-        return
+        return None, "no_mpd"
 
     # 1. Look in the session dir itself (original layout)
     timeline_dir = session_dir / "timelines"
@@ -404,14 +416,11 @@ def process_session(session_dir, output_folder, stop_event=None):
             all_timelines = list(gr_timelines.glob("timeline_*.json"))
             session_dt = _parse_datetime_from_name(session_dir.name)
             if session_dt and all_timelines:
-                # Pick the timeline whose timestamp is closest (but not after) session start
                 def timeline_key(p):
                     dt = _parse_datetime_from_name(p.stem)
                     if dt is None:
                         return float("inf")
                     diff = (session_dt - dt).total_seconds()
-                    # Prefer timelines that started before the session (positive diff)
-                    # but allow up to 5 min after (Steam may start timeline slightly late)
                     if diff < -300:
                         return float("inf")
                     return abs(diff)
@@ -423,27 +432,18 @@ def process_session(session_dir, output_folder, stop_event=None):
         print(f"  WARNING: No timeline JSON found for {session_dir.name}")
         print(f"           Expected in {session_dir / 'timelines'}")
         print(f"           or in {session_dir.parent.parent / 'timelines'}")
-        return
+        return None, "no_timeline"
 
-    # Get session duration and period_start from MPD.
-    # period_start (PT32M6.0S etc.) encodes exactly how many seconds of the
-    # circular buffer have been overwritten since recording started — it is the
-    # authoritative "how far into a long session did the surviving recording begin."
     _, _, session_duration, period_start = parse_mpd_info(session_dir / "session.mpd")
 
     if session_duration == 0:
         print(f"  WARNING: Could not read session duration for {session_dir.name}, skipping.")
-        return
+        return None, "no_duration"
 
-    # Calculate the offset between timeline start and session video start.
-    # Timeline event times (ms) are absolute from the timeline file's start time.
-    # We subtract this offset so event times become session-relative (seconds from video start).
     session_dt = _parse_datetime_from_name(session_dir.name)
     jf = json_files[0]
     timeline_dt = _parse_datetime_from_name(jf.stem)
 
-    # filename_offset = wall-clock gap between when the timeline file was created
-    # and when the background recording session started.
     filename_offset = 0.0
     if session_dt and timeline_dt:
         filename_offset = (session_dt - timeline_dt).total_seconds()
@@ -452,12 +452,6 @@ def process_session(session_dir, output_folder, stop_event=None):
         print(f"           Session: {session_dir.name}  |  Timeline: {jf.stem}")
         print(f"           Clip timing may be inaccurate.")
 
-    # Correct formula:
-    #   timeline_offset = filename_offset + period_start
-    #
-    # filename_offset puts us at the recording session start in timeline coordinates.
-    # period_start tells us how far into the session the surviving circular buffer begins.
-    # Together they give the exact timeline time of the oldest available recording frame.
     timeline_offset_sec = filename_offset + period_start
     print(f"  Timeline offset: {timeline_offset_sec:.1f}s  "
           f"(filename_offset={filename_offset:.1f}s + period_start={period_start:.1f}s)")
@@ -467,7 +461,6 @@ def process_session(session_dir, output_folder, stop_event=None):
         events = parse_timeline_json(jf, timeline_offset_sec)
         all_events.extend(events)
 
-    # Keep only events that fall within the session video
     all_events = [e for e in all_events
                   if 0 <= e["time_sec"] <= session_duration]
 
@@ -475,7 +468,7 @@ def process_session(session_dir, output_folder, stop_event=None):
         print(f"  No timeline events fall within the recording window for {session_dir.name}")
         print(f"  (Recording covers {timeline_offset_sec:.0f}s – "
               f"{timeline_offset_sec + session_duration:.0f}s of the timeline)")
-        return
+        return None, "no_events"
 
     highlights = [e for e in all_events if is_interesting(e)]
 
@@ -484,32 +477,25 @@ def process_session(session_dir, output_folder, stop_event=None):
 
     if not highlights:
         print(f"   No kill/highlight events to extract.")
-        return
-
-    output_folder.mkdir(parents=True, exist_ok=True)
+        return None, "no_highlights"
 
     # ── Smart grouping: merge kills close together into multi-kill clips ──
     highlights.sort(key=lambda e: e["time_sec"])
 
-    def is_kill_event(event):
-        label = (event.get("type", "") + " " + event.get("label", "")).lower()
-        return any(kw in label for kw in KILL_EVENTS)
-
-    groups = []  # Each group: { "events": [...], "start": float, "end": float, "is_multikill": bool }
+    groups = []
 
     for h in highlights:
         t = h["time_sec"]
         placed = False
 
-        # Try to extend an existing group if within the merge window
         for group in reversed(groups):
             gap = t - group["end"]
-            window = MULTI_KILL_MERGE_WINDOW if (group["is_multikill"] or is_kill_event(h)) else 15
+            window = MULTI_KILL_MERGE_WINDOW if (group["is_multikill"] or _is_kill_event(h)) else 15
             if gap <= window:
                 group["events"].append(h)
                 group["end"] = t
                 group["is_multikill"] = group["is_multikill"] or (
-                    is_kill_event(h) and any(is_kill_event(e) for e in group["events"][:-1])
+                    _is_kill_event(h) and any(_is_kill_event(e) for e in group["events"][:-1])
                 )
                 placed = True
                 break
@@ -522,14 +508,149 @@ def process_session(session_dir, output_folder, stop_event=None):
                 "is_multikill": False,
             })
 
-    # Mark groups with 2+ kills as multi-kill
     for group in groups:
-        kill_count = sum(1 for e in group["events"] if is_kill_event(e))
+        kill_count = sum(1 for e in group["events"] if _is_kill_event(e))
         group["kill_count"] = kill_count
         group["is_multikill"] = kill_count >= 2
 
     print(f"   Grouped into {len(groups)} clip(s) "
           f"({sum(1 for g in groups if g['is_multikill'])} multi-kill)\n")
+
+    return groups, None
+
+
+def scan_session_groups(session_dir, output_folder):
+    """
+    Parse a session directory and return a list of enriched group dicts.
+    Returns None on any error (no mpd, no timeline, no events, etc.).
+
+    Each group dict contains all base keys (events, start, end, is_multikill,
+    kill_count) plus computed fields:
+        pre_shift, clip_start, clip_end, clip_duration,
+        tag, ts_label, out_name, out_path, session_dir
+    """
+    groups, error = _parse_session_groups(session_dir)
+    if groups is None:
+        return None
+
+    enriched = []
+    for i, group in enumerate(groups, 1):
+        kill_count = group["kill_count"]
+        pre_shift = KILL_EVENT_PRE_SHIFT if kill_count > 0 else 0
+        clip_start = max(0.0, group["start"] - CLIP_PADDING_BEFORE - pre_shift)
+        clip_end = group["end"] + CLIP_PADDING_AFTER + pre_shift
+        clip_duration = clip_end - clip_start
+
+        if group["is_multikill"]:
+            tag = f"{kill_count}k"
+        else:
+            events = group["events"]
+            raw_tag = events[0]["label"].encode("ascii", errors="replace").decode("ascii")
+            tag = re.sub(r"[^\w\s-]", "", raw_tag)[:20].strip().replace(" ", "_")
+
+        ts_label = f"{int(group['start']//60)}m{int(group['start']%60):02d}s"
+        out_name = f"{session_dir.name}_{ts_label}_{tag}_{i}.mp4"
+        out_path = output_folder / out_name
+
+        enriched_group = dict(group)
+        enriched_group["pre_shift"] = pre_shift
+        enriched_group["clip_start"] = clip_start
+        enriched_group["clip_end"] = clip_end
+        enriched_group["clip_duration"] = clip_duration
+        enriched_group["tag"] = tag
+        enriched_group["ts_label"] = ts_label
+        enriched_group["out_name"] = out_name
+        enriched_group["out_path"] = out_path
+        enriched_group["session_dir"] = session_dir
+        enriched.append(enriched_group)
+
+    return enriched
+
+
+def merge_clips(clip_paths, output_path):
+    """
+    Concatenate a list of MP4 files into one output file.
+    Uses ffmpeg concat demuxer with stream copy — no re-encode, very fast.
+    Returns True on success, False on failure.
+    """
+    if not FFMPEG_BIN:
+        print("  ERROR: ffmpeg not found.")
+        return False
+
+    import tempfile
+    list_file = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as f:
+            for p in clip_paths:
+                f.write(f"file '{str(p).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+            list_file = f.name
+
+        no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-f", "concat", "-safe", "0", "-i", list_file,
+            "-c", "copy", "-movflags", "+faststart",
+            str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=600,
+                                creationflags=no_window)
+        if result.returncode != 0:
+            err = result.stderr.decode(errors="replace")
+            error_lines = [l for l in err.splitlines()
+                           if "Error" in l or "Invalid" in l or "No such" in l]
+            short_err = error_lines[-1] if error_lines else err[-300:]
+            print(f"  WARNING: merge error: {short_err}")
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        print("  WARNING: ffmpeg merge timed out.")
+        return False
+    except (FileNotFoundError, TypeError):
+        print("  ERROR: ffmpeg not found.")
+        return False
+    finally:
+        if list_file:
+            try:
+                os.unlink(list_file)
+            except Exception:
+                pass
+
+
+def export_single_group(group, stop_event=None):
+    """
+    Export one enriched group dict produced by scan_session_groups.
+
+    Returns:
+        "skipped"  — output file already exists
+        "stopped"  — stop_event was set before export started
+        True       — export succeeded
+        False      — export failed
+    """
+    if group["out_path"].exists():
+        return "skipped"
+    if stop_event and stop_event.is_set():
+        return "stopped"
+    success = export_clip(
+        group["session_dir"],
+        group["clip_start"],
+        group["clip_duration"],
+        group["out_path"],
+    )
+    return True if success else False
+
+
+def process_session(session_dir, output_folder, stop_event=None):
+    mpd_path = session_dir / "session.mpd"
+    if not mpd_path.exists():
+        return
+
+    groups, error = _parse_session_groups(session_dir)
+    if groups is None:
+        return
+
+    output_folder.mkdir(parents=True, exist_ok=True)
 
     total_groups = len(groups)
     exported = 0
@@ -543,17 +664,16 @@ def process_session(session_dir, output_folder, stop_event=None):
                   f"Resume will continue from here (already-saved clips are skipped).")
             return False  # interrupted
 
-        events = group["events"]
+        # Enrich the group with computed fields (reuse scan_session_groups logic)
         kill_count = group["kill_count"]
-        # For kill groups, shift start earlier to capture the shot (not just the death)
         pre_shift = KILL_EVENT_PRE_SHIFT if kill_count > 0 else 0
         clip_start = max(0.0, group["start"] - CLIP_PADDING_BEFORE - pre_shift)
         clip_end   = group["end"] + CLIP_PADDING_AFTER + pre_shift
         clip_duration = clip_end - clip_start
 
-        # Build a readable label
+        events = group["events"]
         if group["is_multikill"]:
-            tag = f"{kill_count}k"  # e.g. "3k" for triple kill
+            tag = f"{kill_count}k"
         else:
             raw_tag = events[0]["label"].encode("ascii", errors="replace").decode("ascii")
             tag = re.sub(r"[^\w\s-]", "", raw_tag)[:20].strip().replace(" ", "_")

@@ -1,0 +1,36 @@
+{
+  "productName": "SteamHighlightExtractor",
+  "version": "1.2.0",
+  "identifier": "com.steamhighlightextractor.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Steam Highlight Extractor",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 860,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src http://127.0.0.1:7847; style-src 'unsafe-inline' 'self'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/app-icon.ico",
+      "icons/app-icon.png"
+    ],
+    "externalBin": []
+  }
+}

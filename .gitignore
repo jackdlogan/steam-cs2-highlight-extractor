@@ -4,7 +4,7 @@ SteamHighlights/
 # PyInstaller build artifacts
 build/
 dist/
-*.spec
+SteamHighlightExtractor.spec
 
 # Python cache
 __pycache__/
@@ -15,7 +15,7 @@ __pycache__/
 ffmpeg.exe
 ffprobe.exe
 
-# Generated icon (built from app-icon.png)
+# App icon (generated)
 app-icon.ico
 
 # OS files
@@ -25,3 +25,13 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Test / scratch files
+*.mp4
+
+# ── Tauri / frontend ──────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+frontend/src-tauri/binaries/
