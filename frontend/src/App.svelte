@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte'
+  import { open as openDialog } from '@tauri-apps/plugin-dialog'
   import { getStatus, getDefaults, getSessions, stopExport, openOutput, streamPost } from './lib/api.js'
 
   // ── Server / init state ────────────────────────────────────────────
@@ -199,6 +200,19 @@
     await openOutput(outputFolder)
   }
 
+  async function browseRecordingPath() {
+    const selected = await openDialog({ directory: true, multiple: false, title: 'Select Steam Recording Folder' })
+    if (selected) {
+      recordingPath = selected
+      await refreshSessions()
+    }
+  }
+
+  async function browseOutputFolder() {
+    const selected = await openDialog({ directory: true, multiple: false, title: 'Select Output Folder' })
+    if (selected) outputFolder = selected
+  }
+
   function onReset() {
     phase    = 'results'
     logs     = []
@@ -260,12 +274,15 @@
 
     <div class="section-label">Recording Path</div>
     <div class="sidebar-pad">
-      <input
-        type="text"
-        bind:value={recordingPath}
-        placeholder="Auto-detect…"
-        on:change={refreshSessions}
-      />
+      <div class="path-row">
+        <input
+          type="text"
+          bind:value={recordingPath}
+          placeholder="Auto-detect…"
+          on:change={refreshSessions}
+        />
+        <button class="browse-btn" on:click={browseRecordingPath} title="Browse folder">📁</button>
+      </div>
     </div>
 
     <div class="section-label" style="margin-top:8px">
@@ -329,7 +346,10 @@
     <div class="sidebar-sep"></div>
     <div class="section-label">Output Folder</div>
     <div class="sidebar-pad">
-      <input type="text" bind:value={outputFolder} placeholder="SteamHighlights/" />
+      <div class="path-row">
+        <input type="text" bind:value={outputFolder} placeholder="SteamHighlights/" />
+        <button class="browse-btn" on:click={browseOutputFolder} title="Browse folder">📁</button>
+      </div>
     </div>
 
   </aside>
@@ -565,6 +585,30 @@ header {
 .sidebar-pad {
   padding: 4px 10px 8px;
 }
+
+.path-row {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.path-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.browse-btn {
+  flex-shrink: 0;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13px;
+  padding: 3px 7px;
+  cursor: pointer;
+  line-height: 1;
+}
+.browse-btn:hover { background: var(--border); }
 
 .sidebar-sep {
   height: 1px;
