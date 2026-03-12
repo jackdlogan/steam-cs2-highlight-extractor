@@ -94,6 +94,7 @@
       sessions = data.sessions || []
       if (sessions.length > 0 && selectedSessions.size === 0) {
         selectedSessions = new Set([sessions[sessions.length - 1]])
+        onScan()
       }
     } catch { /* ignore */ }
   }
@@ -103,10 +104,12 @@
     if (selectedSessions.has(name)) selectedSessions.delete(name)
     else selectedSessions.add(name)
     selectedSessions = selectedSessions
+    onScan()
   }
 
   function selectAllSessions() {
     selectedSessions = new Set(sessions)
+    onScan()
   }
 
   function clearSessionSelection() {
@@ -456,11 +459,12 @@
   <div class="footer-left">
     {#if phase === 'idle' || phase === 'results' || phase === 'done'}
       <button
-        class="btn-primary"
+        class="btn-ghost"
         on:click={onScan}
         disabled={busy || selectedSessions.size === 0}
+        title="Re-scan selected sessions"
       >
-        ↻ Scan
+        ↻ Refresh
       </button>
     {/if}
 
