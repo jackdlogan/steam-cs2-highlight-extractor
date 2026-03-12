@@ -259,7 +259,8 @@ def export_groups(req: ExportRequest):
     def _run():
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = sys.stderr = _QueueWriter(q)
-        exported_paths = []
+        exported_paths = []   # all clips to include in merge
+        new_paths      = []   # only clips we just created (can be deleted after merge)
         try:
             for i, group in enumerate(groups, 1):
                 if _stop_event.is_set():
@@ -285,8 +286,9 @@ def export_groups(req: ExportRequest):
                 safe_name = out_name.encode("ascii", errors="replace").decode("ascii")
 
                 if result == "skipped":
+                    # File already existed — include in merge but don't delete it
                     q.put({"type": "log",
-                           "text":  f"  [{i}/{total}] Skipped: {safe_name}\n",
+                           "text":  f"  [{i}/{total}] Already exists: {safe_name}\n",
                            "level": "info"})
                     exported_paths.append(group["out_path"])
                 elif result == "stopped":
@@ -295,16 +297,22 @@ def export_groups(req: ExportRequest):
                 elif result is True:
                     out_path = group["out_path"]
                     exported_paths.append(out_path)
+                    new_paths.append(out_path)
                     size_mb = out_path.stat().st_size / 1_000_000 if out_path.exists() else 0
-                    q.put({"type": "log",
-                           "text":  f"  [{i}/{total}] Saved: {safe_name}  ({size_mb:.1f} MB)\n",
-                           "level": "ok"})
+                    if not do_merge:
+                        q.put({"type": "log",
+                               "text":  f"  [{i}/{total}] Saved: {safe_name}  ({size_mb:.1f} MB)\n",
+                               "level": "ok"})
+                    else:
+                        q.put({"type": "log",
+                               "text":  f"  [{i}/{total}] Rendered: {safe_name}  ({size_mb:.1f} MB)\n",
+                               "level": "info"})
                 else:
                     q.put({"type": "log",
                            "text":  f"  [{i}/{total}] Failed: {safe_name}\n",
                            "level": "err"})
 
-            # Optional merge
+            # Merge
             if do_merge and len(exported_paths) > 1:
                 from datetime import datetime
                 merged_name = f"highlights_merged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
@@ -318,9 +326,16 @@ def export_groups(req: ExportRequest):
                     q.put({"type": "log",
                            "text":  f"  ✓ Merged: {merged_name}  ({size_mb:.1f} MB)\n",
                            "level": "ok"})
+                    # Delete individual clips that were just created for this merge
+                    for p in new_paths:
+                        try:
+                            Path(p).unlink(missing_ok=True)
+                        except Exception:
+                            pass
                 else:
                     q.put({"type": "log",
-                           "text": "  WARNING: Merge failed.\n", "level": "warn"})
+                           "text": "  WARNING: Merge failed — individual clips kept.\n",
+                           "level": "warn"})
             elif do_merge:
                 q.put({"type": "log",
                        "text": "  (Merge skipped — need at least 2 clips)\n",
