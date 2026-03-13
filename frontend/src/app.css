@@ -10,8 +10,8 @@
   --yellow:   #f0c040;
   --text:     #e2e8f0;
   --muted:    #94a3b8;
-  --font-mono: 'IBM Plex Mono', 'Consolas', 'Courier New', monospace;
-  --font-sans: 'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'IBM Plex Mono', 'Consolas', monospace;
+  --font-sans: 'Inter', 'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif;
   --radius:   6px;
   --radius-sm: 4px;
 }
@@ -142,7 +142,29 @@ label {
   font-size: 10px;
   font-weight: 700;
   font-family: var(--font-mono);
-  padding: 1px 6px;
-  border-radius: 3px;
+  padding: 3px 7px;
+  border-radius: 4px;
   line-height: 1.4;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
 }
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface2);
+  outline: none;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--blue);
+  cursor: pointer;
+  border: none;
+}
+input[type="range"]:focus { border: none; }

@@ -97,6 +97,41 @@ def _find_ffmpeg():
 FFMPEG_BIN = _find_ffmpeg()
 
 
+def _detect_gpu_encoder():
+    """
+    Probe ffmpeg for available GPU H.264 encoders.
+    Returns the first working encoder name, or None to fall back to libx264.
+    Tries NVIDIA NVENC → AMD AMF → Intel Quick Sync in order.
+    """
+    if not FFMPEG_BIN:
+        return None
+
+    candidates = [
+        "h264_nvenc",   # NVIDIA NVENC
+        "h264_amf",     # AMD AMF / VCE
+        "h264_qsv",     # Intel Quick Sync
+    ]
+    no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    for enc in candidates:
+        try:
+            result = subprocess.run(
+                [FFMPEG_BIN, "-y",
+                 "-f", "lavfi", "-i", "nullsrc=s=32x32:d=0.1",
+                 "-vframes", "1", "-c:v", enc,
+                 "-f", "null", "-"],
+                capture_output=True, timeout=10,
+                creationflags=no_window,
+            )
+            if result.returncode == 0:
+                return enc
+        except Exception:
+            continue
+    return None
+
+
+GPU_ENCODER = _detect_gpu_encoder()
+
+
 def check_ffmpeg():
     if FFMPEG_BIN:
         return
@@ -346,8 +381,18 @@ def export_clip(session_dir, start_sec, duration, output_path):
         cmd += ["-vf", vf, "-af", af]
     else:
         cmd += ["-vf", vf, "-an"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-movflags", "+faststart"]
+    if GPU_ENCODER == "h264_nvenc":
+        cmd += ["-c:v", "h264_nvenc", "-preset", "p4",
+                "-rc:v", "vbr", "-cq:v", "23"]
+    elif GPU_ENCODER == "h264_amf":
+        cmd += ["-c:v", "h264_amf", "-quality", "speed",
+                "-qp_i", "23", "-qp_p", "23", "-qp_b", "23"]
+    elif GPU_ENCODER == "h264_qsv":
+        cmd += ["-c:v", "h264_qsv", "-preset", "faster",
+                "-global_quality", "23"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+    cmd += ["-c:a", "aac", "-movflags", "+faststart"]
     cmd += [str(output_path)]
 
     if not FFMPEG_BIN:
@@ -373,6 +418,48 @@ def export_clip(session_dir, start_sec, duration, output_path):
     except (FileNotFoundError, TypeError):
         print("    ERROR: ffmpeg not found. Run:  winget install Gyan.FFmpeg")
         return False
+
+
+def extract_thumbnail(session_dir, clip_start, clip_duration, out_name, thumbnail_dir):
+    """Extract a single JPEG frame at the clip midpoint from the raw DASH recording."""
+    if not FFMPEG_BIN:
+        return None
+    midpoint = clip_start + clip_duration / 2
+    mpd_path = session_dir / "session.mpd"
+    start_number, seg_dur, _, _ = parse_mpd_info(mpd_path)
+    chunk_idx = int(midpoint / seg_dur)
+    chunk_num = start_number + chunk_idx
+    offset_in_chunk = midpoint - chunk_idx * seg_dur
+
+    init  = session_dir / "init-stream0.m4s"
+    chunk = session_dir / f"chunk-stream0-{chunk_num:05d}.m4s"
+    if not chunk.exists():
+        return None
+
+    files  = ([str(init)] if init.exists() else []) + [str(chunk)]
+    concat = "|".join(files)
+    thumbnail_dir.mkdir(parents=True, exist_ok=True)
+    thumb_path = thumbnail_dir / f"{Path(out_name).stem}.jpg"
+
+    vf = (f"setpts=PTS-STARTPTS,"
+          f"trim=start={offset_in_chunk:.3f}:duration=0.5,"
+          f"setpts=PTS-STARTPTS,scale=320:180")
+    cmd = [FFMPEG_BIN, "-y",
+           "-i", f"concat:{concat}",
+           "-vf", vf,
+           "-vframes", "1",
+           "-q:v", "4",
+           str(thumb_path)]
+
+    try:
+        no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        result = subprocess.run(cmd, capture_output=True, timeout=30,
+                                creationflags=no_window)
+        if result.returncode == 0 and thumb_path.exists():
+            return thumb_path
+    except Exception:
+        pass
+    return None
 
 
 # ── Session processing ────────────────────────────────────────────────────────

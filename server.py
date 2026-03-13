@@ -14,19 +14,23 @@ import json
 import queue
 import threading
 import asyncio
+import time
+import tempfile
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 import steam_highlight_extractor as core
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Steam Highlight Extractor", version="1.2.0")
+app = FastAPI(title="Steam Highlight Extractor", version="2.0.1")
+
+_thumbnail_dir = Path(tempfile.gettempdir()) / "steam_hl_thumbs"
 
 app.add_middleware(
     CORSMiddleware,
@@ -136,6 +140,8 @@ def _serialize_group(group: dict) -> dict:
     out = {}
     for k, v in group.items():
         out[k] = str(v) if isinstance(v, Path) else v
+    if "thumbnail_file" in out:
+        out["thumbnail_url"] = f"http://127.0.0.1:7847/api/thumbnail/{out['thumbnail_file']}"
     return out
 
 
@@ -157,6 +163,7 @@ def get_status():
         "ok":           True,
         "ffmpeg_path":  core.FFMPEG_BIN,
         "ffmpeg_found": bool(core.FFMPEG_BIN),
+        "gpu_encoder":  core.GPU_ENCODER,
     }
 
 
@@ -217,6 +224,16 @@ def scan_sessions(req: ScanRequest):
                 if not groups:
                     continue
                 for group in groups:
+                    group["session_name"] = session.name
+                    thumb = core.extract_thumbnail(
+                        group["session_dir"],
+                        group["clip_start"],
+                        group["clip_duration"],
+                        group["out_name"],
+                        _thumbnail_dir,
+                    )
+                    if thumb:
+                        group["thumbnail_file"] = thumb.name
                     q.put({"type": "group", "data": _serialize_group(group)})
             q.put({"type": "progress", "value": 1.0})
             q.put({"type": "done"})
@@ -275,42 +292,51 @@ def export_groups(req: ExportRequest):
                        "current": i - 1,
                        "total":   total})
 
+                out_name  = group.get("out_name", "?")
+                safe_name = out_name.encode("ascii", errors="replace").decode("ascii")
+
+                q.put({"type": "clip_start",
+                       "index": i, "total": total, "name": safe_name,
+                       "tag": group.get("tag", ""), "duration": group.get("clip_duration", 0)})
+
+                t0 = time.time()
                 try:
                     result = core.export_single_group(group, stop_event=_stop_event)
                 except Exception as exc:
                     q.put({"type": "log",
                            "text": f"\nERROR: {exc}\n", "level": "err"})
                     result = False
-
-                out_name  = group.get("out_name", "?")
-                safe_name = out_name.encode("ascii", errors="replace").decode("ascii")
+                elapsed = round(time.time() - t0, 1)
 
                 if result == "skipped":
-                    # File already existed — include in merge but don't delete it
                     q.put({"type": "log",
                            "text":  f"  [{i}/{total}] Already exists: {safe_name}\n",
                            "level": "info"})
+                    q.put({"type": "clip_done",
+                           "index": i, "status": "skipped", "size_mb": 0, "elapsed": elapsed})
                     exported_paths.append(group["out_path"])
                 elif result == "stopped":
+                    q.put({"type": "clip_done",
+                           "index": i, "status": "stopped", "size_mb": 0, "elapsed": elapsed})
                     q.put({"type": "done", "stopped": True})
                     return
                 elif result is True:
                     out_path = group["out_path"]
                     exported_paths.append(out_path)
                     new_paths.append(out_path)
-                    size_mb = out_path.stat().st_size / 1_000_000 if out_path.exists() else 0
-                    if not do_merge:
-                        q.put({"type": "log",
-                               "text":  f"  [{i}/{total}] Saved: {safe_name}  ({size_mb:.1f} MB)\n",
-                               "level": "ok"})
-                    else:
-                        q.put({"type": "log",
-                               "text":  f"  [{i}/{total}] Rendered: {safe_name}  ({size_mb:.1f} MB)\n",
-                               "level": "info"})
+                    size_mb = round(out_path.stat().st_size / 1_000_000, 1) if out_path.exists() else 0
+                    label = "Rendered" if do_merge else "Saved"
+                    q.put({"type": "log",
+                           "text":  f"  [{i}/{total}] {label}: {safe_name}  ({size_mb} MB)\n",
+                           "level": "ok" if not do_merge else "info"})
+                    q.put({"type": "clip_done",
+                           "index": i, "status": "ok", "size_mb": size_mb, "elapsed": elapsed})
                 else:
                     q.put({"type": "log",
                            "text":  f"  [{i}/{total}] Failed: {safe_name}\n",
                            "level": "err"})
+                    q.put({"type": "clip_done",
+                           "index": i, "status": "failed", "size_mb": 0, "elapsed": elapsed})
 
             # Merge
             if do_merge and len(exported_paths) > 1:
@@ -364,6 +390,17 @@ def stop():
     """Signal the active export to stop after the current clip."""
     _stop_event.set()
     return {"ok": True}
+
+
+@app.get("/api/thumbnail/{filename}")
+def get_thumbnail(filename: str):
+    """Serve a generated thumbnail JPEG."""
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = _thumbnail_dir / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(str(path), media_type="image/jpeg")
 
 
 @app.post("/api/open-output")
