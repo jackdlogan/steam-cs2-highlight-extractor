@@ -881,11 +881,6 @@ header {
   vertical-align: middle;
 }
 .badge-icon:first-child { margin-left: 0; }
-.badge-icon svg {
-  width: 11px;
-  height: 11px;
-  display: block;
-}
 
 .gpu-badge {
   color: var(--green);
@@ -1096,11 +1091,7 @@ header {
   cursor: pointer;
   transition: all 0.12s;
 }
-.pill-toggle svg {
-  width: 12px;
-  height: 12px;
-  flex-shrink: 0;
-}
+
 .pill-toggle:hover { border-color: var(--blue); color: var(--text); }
 .pill-on {
   background: rgba(79,158,255,0.08);
