@@ -538,8 +538,11 @@ def export_clip(session_dir, start_sec, duration, output_path):
 
     # Chunks carry absolute PTS (e.g. ~1926s). We reset PTS to 0 with setpts/asetpts,
     # then use trim/atrim to cut exactly offset_in_chunk seconds from the start.
-    vf = f"setpts=PTS-STARTPTS,trim=start={offset_in_chunk:.6f}:duration={duration:.6f},setpts=PTS-STARTPTS"
+    vf_base = f"setpts=PTS-STARTPTS,trim=start={offset_in_chunk:.6f}:duration={duration:.6f},setpts=PTS-STARTPTS"
     af = f"asetpts=PTS-STARTPTS,atrim=start={offset_in_chunk:.6f}:duration={duration:.6f},asetpts=PTS-STARTPTS"
+
+    # h264_qsv requires NV12 input — add format conversion after software filters
+    vf = vf_base + (",format=nv12" if GPU_ENCODER == "h264_qsv" else "")
 
     cmd = [FFMPEG_BIN, "-y"]
     cmd += ["-i", f"concat:{v_concat}"]
@@ -580,10 +583,19 @@ def export_clip(session_dir, start_sec, duration, output_path):
             error_lines = [l for l in err.splitlines() if "Error" in l or "Invalid" in l or "No such" in l]
             short_err = error_lines[-1] if error_lines else err[-300:]
             print(f"    WARNING: ffmpeg error: {short_err}")
+            # Remove partial output file so next Export attempt won't skip this clip
+            try:
+                output_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return False
         return True
     except subprocess.TimeoutExpired:
         print("    WARNING: ffmpeg timed out after 5 minutes. Skipping this clip.")
+        try:
+            output_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         return False
     except (FileNotFoundError, TypeError):
         print("    ERROR: ffmpeg not found. Run:  winget install Gyan.FFmpeg")
@@ -789,7 +801,7 @@ def _parse_session_groups(session_dir):
                 "is_multikill": False,
             })
 
-        print(f"   Round-based grouping: {len(phase_times)} boundaries → {len(groups)} round group(s)")
+        print(f"   Round-based grouping: {len(phase_times)} boundaries -> {len(groups)} round group(s)")
     else:
         # Fallback when no phase data: merge window
         print(f"   No round boundaries found — using {MULTI_KILL_MERGE_WINDOW}s merge window fallback")
@@ -965,7 +977,8 @@ def export_single_group(group, stop_event=None, force=False):
         True       — export succeeded
         False      — export failed
     """
-    if not force and group["out_path"].exists():
+    out_path = group["out_path"]
+    if not force and out_path.exists() and out_path.stat().st_size > 10_000:
         return "skipped"
     if stop_event and stop_event.is_set():
         return "stopped"
@@ -987,7 +1000,7 @@ def export_single_group(group, stop_event=None, force=False):
             group["session_dir"],
             group["clip_start"],
             group["clip_duration"],
-            group["out_path"],
+            out_path,
         ) else False
 
     # Multiple segments — export each to a temp file then merge
@@ -1006,7 +1019,7 @@ def export_single_group(group, stop_event=None, force=False):
             tmp_clips.append(tmp_path)
 
         print(f"    Jump-cutting {len(tmp_clips)} segments together…")
-        return merge_clips(tmp_clips, group["out_path"])
+        return merge_clips(tmp_clips, out_path)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1126,7 +1139,7 @@ def main():
         print("\nERROR: Could not find Steam game recording folder.")
         print()
         print("  Make sure Game Recording is enabled in Steam:")
-        print("    Steam → Settings → Game Recording")
+        print("    Steam > Settings > Game Recording")
         print()
         print("  Then either:")
         print("    A) Set STEAM_RECORDING_PATH at the top of this script, OR")

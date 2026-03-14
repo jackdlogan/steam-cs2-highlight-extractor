@@ -268,6 +268,9 @@ def export_groups(req: ExportRequest):
     groups     = [_deserialize_group(g) for g in req.groups]
     output_dir = Path(req.config.output_folder)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Re-anchor out_path to the current output folder (scan-time path may differ)
+    for g in groups:
+        g["out_path"] = output_dir / g["out_path"].name
     total      = len(groups)
     do_merge   = req.merge
 

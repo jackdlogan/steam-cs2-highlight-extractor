@@ -7,8 +7,8 @@ REM    pip install pyinstaller fastapi uvicorn pydantic
 REM
 REM  Output:
 REM    frontend\src-tauri\target\release\bundle\
-REM      nsis\SteamHighlightExtractor_2.0.2_x64-setup.exe  (installer)
-REM      msi\SteamHighlightExtractor_2.0.2_x64_en-US.msi   (MSI)
+REM      nsis\SteamHighlightExtractor_2.1.0_x64-setup.exe  (installer)
+REM      msi\SteamHighlightExtractor_2.1.0_x64_en-US.msi   (MSI)
 REM ============================================================
 
 setlocal

@@ -338,6 +338,7 @@
             ? { ...c, status: event.status, size_mb: event.size_mb, elapsed: event.elapsed }
             : c
         )
+        if (event.status === 'failed') showLog = true
       } else if (event.type === 'progress') {
         progress = event.value
       } else if (event.type === 'done') {
@@ -345,8 +346,9 @@
         phase    = 'done'
         progress = 1
       } else if (event.type === 'error') {
-        logs  = [...logs, { text: 'Error: ' + event.message, level: 'err' }]
-        phase = 'done'
+        logs     = [...logs, { text: 'Error: ' + event.message, level: 'err' }]
+        showLog  = true
+        phase    = 'done'
       }
     })
   }
@@ -936,13 +938,13 @@ header {
 .status-text { color: var(--muted); }
 .status-sep  { color: var(--border); }
 .ffmpeg-ok   { color: var(--muted); }
-.badge-icon {
+:global(.badge-icon) {
   display: inline-flex;
   align-items: center;
   margin-left: 2px;
   vertical-align: middle;
 }
-.badge-icon:first-child { margin-left: 0; }
+:global(.badge-icon:first-child) { margin-left: 0; }
 
 .gpu-badge {
   color: var(--green);
