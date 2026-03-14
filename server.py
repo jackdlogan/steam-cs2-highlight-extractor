@@ -52,7 +52,6 @@ class Config(BaseModel):
     pad_before:         int  = core.CLIP_PADDING_BEFORE
     pad_after:          int  = core.CLIP_PADDING_AFTER
     pre_shift:          int  = core.KILL_EVENT_PRE_SHIFT
-    merge_window:       int  = core.MULTI_KILL_MERGE_WINDOW
     jump_cut_threshold: int  = core.JUMP_CUT_THRESHOLD
     extract_kills:      bool = True
     extract_deaths:     bool = False
@@ -119,7 +118,6 @@ def _apply_config(cfg: Config):
     core.CLIP_PADDING_BEFORE     = cfg.pad_before
     core.CLIP_PADDING_AFTER      = cfg.pad_after
     core.KILL_EVENT_PRE_SHIFT    = cfg.pre_shift
-    core.MULTI_KILL_MERGE_WINDOW = cfg.merge_window
     core.JUMP_CUT_THRESHOLD      = cfg.jump_cut_threshold
 
     want_kills  = cfg.extract_kills
@@ -293,7 +291,7 @@ def export_groups(req: ExportRequest):
                        "tag": group.get("tag", ""), "duration": group.get("clip_duration", 0)})
                 t0 = time.time()
                 try:
-                    result = core.export_single_group(group, stop_event=_stop_event)
+                    result = core.export_single_group(group, stop_event=_stop_event, force=do_merge)
                 except Exception as exc:
                     return i, group, safe_name, False, round(time.time() - t0, 1), str(exc)
                 return i, group, safe_name, result, round(time.time() - t0, 1), None

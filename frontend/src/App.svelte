@@ -5,6 +5,19 @@
   import killIconRaw  from './assets/kill-icon.svg?raw'
   import deathIconRaw from './assets/death-icon.svg?raw'
 
+  // Build map code → icon URL from all files in assets/map-icon/
+  // Filename examples: "32px-De_ancient.png", "32px-Map_icon_de_golden.png"
+  const _mapIconModules = import.meta.glob('./assets/map-icon/*.png', { eager: true })
+  const mapIcons = {}
+  for (const [path, mod] of Object.entries(_mapIconModules)) {
+    const filename = path.split('/').pop().replace(/\.png$/i, '')
+    const code = filename
+      .replace(/^32px-/i, '')
+      .replace(/^Map_icon_/i, '')
+      .toLowerCase()
+    mapIcons[code] = mod.default
+  }
+
   function prepIcon(raw, color, size = 12) {
     return raw
       .replace(/\s+width="[^"]*"/, ` width="${size}"`)
@@ -39,7 +52,6 @@
   let padBefore     = 1
   let padAfter      = 5
   let preShift      = 3
-  let mergeWindow   = 45
   let extractKills  = true
   let extractDeaths = false
   let doMerge       = false
@@ -54,6 +66,8 @@
   // ── Kill feed ──────────────────────────────────────────────────────
   let groups         = []
   let selectedGroups = new Set()  // by out_name
+  let mapFilter      = 'all'
+  let multiKillOnly  = false
 
   // ── Progress / logs ────────────────────────────────────────────────
   let phase          = 'idle'  // idle | scanning | results | exporting | done
@@ -66,12 +80,22 @@
   let showLog         = false
 
   // ── Derived ────────────────────────────────────────────────────────
-  $: selectedGroupList = groups.filter(g => selectedGroups.has(g.out_name))
-  $: selectedCount     = selectedGroups.size
-  $: multiKillCount    = groups.filter(g => g.tag !== 'KILL' && g.tag !== 'DEATH').length
+  // allMaps: array of { code, display } — code used for filtering, display shown in UI
+  $: allMaps = [...new Map(
+      groups.filter(g => g.map_name).map(g => [g.map_name, g.map_display || g.map_name])
+    ).entries()].map(([code, display]) => ({ code, display })).sort((a, b) => a.display.localeCompare(b.display))
+  $: filteredGroups = groups.filter(g => {
+    if (mapFilter !== 'all' && g.map_name !== mapFilter) return false
+    if (multiKillOnly && (g.kill_count || 0) < 2) return false
+    return true
+  })
+
+  $: selectedGroupList = filteredGroups.filter(g => selectedGroups.has(g.out_name))
+  $: selectedCount     = selectedGroupList.length
+  $: multiKillCount    = groups.filter(g => (g.kill_count || 0) >= 2).length
   $: busy              = phase === 'scanning' || phase === 'exporting'
   $: currentClipNum    = exportTotal > 0 ? Math.min(Math.ceil(progress * exportTotal), exportTotal) : 0
-  $: scanConfig        = { padBefore, padAfter, preShift, mergeWindow, extractKills, extractDeaths }
+  $: scanConfig        = { padBefore, padAfter, preShift, extractKills, extractDeaths }
   $: settingsDirty     = lastApplied !== null && JSON.stringify(scanConfig) !== JSON.stringify(lastApplied)
 
   function config() {
@@ -81,7 +105,6 @@
       pad_before:     padBefore,
       pad_after:      padAfter,
       pre_shift:      preShift,
-      merge_window:   mergeWindow,
       extract_kills:  extractKills,
       extract_deaths: extractDeaths,
     }
@@ -129,6 +152,8 @@
     groupCache     = {}
     groups         = []
     selectedGroups = new Set()
+    mapFilter      = 'all'
+    multiKillOnly  = false
     try {
       const data = await getSessions(recordingPath)
       if (data.recording_path) recordingPath = data.recording_path
@@ -183,11 +208,12 @@
   }
 
   function selectAllGroups() {
-    selectedGroups = new Set(groups.map(g => g.out_name))
+    selectedGroups = new Set([...selectedGroups, ...filteredGroups.map(g => g.out_name)])
   }
 
   function clearGroupSelection() {
-    selectedGroups = new Set()
+    const filteredNames = new Set(filteredGroups.map(g => g.out_name))
+    selectedGroups = new Set([...selectedGroups].filter(n => !filteredNames.has(n)))
   }
 
   // ── Scan ───────────────────────────────────────────────────────────
@@ -258,6 +284,8 @@
     for (const name of selectedSessions) delete groupCache[name]
     groups         = []
     selectedGroups = new Set()
+    mapFilter      = 'all'
+    multiKillOnly  = false
     await scanNewSessions([...selectedSessions])
   }
 
@@ -329,6 +357,10 @@
 
   async function onOpenFolder() {
     await openOutput(outputFolder)
+  }
+
+  async function openRecordingFolder() {
+    if (recordingPath) await openOutput(recordingPath)
   }
 
   async function browseRecordingPath() {
@@ -461,9 +493,10 @@
           type="text"
           bind:value={recordingPath}
           placeholder="Auto-detect…"
-          on:change={refreshSessions}
+          readonly
+          on:click={browseRecordingPath}
         />
-        <button class="field-arrow" on:click={browseRecordingPath} title="Browse">
+        <button class="field-arrow" on:click={openRecordingFolder} title="Open in Explorer" disabled={!recordingPath}>
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M4 2L8 6L4 10" stroke="var(--blue)" stroke-width="1.5" stroke-linecap="round"/></svg>
         </button>
       </div>
@@ -528,13 +561,6 @@
         <div class="setting-control">
           <input type="range" bind:value={preShift} min="0" max="10" />
           <span class="setting-val">{preShift}s</span>
-        </div>
-      </div>
-      <div class="setting-row">
-        <span class="setting-label">Merge window</span>
-        <div class="setting-control">
-          <input type="range" bind:value={mergeWindow} min="0" max="120" />
-          <span class="setting-val">{mergeWindow}s</span>
         </div>
       </div>
       <div class="setting-row">
@@ -619,7 +645,9 @@
         <div class="results-title">
           Kill Feed
           {#if groups.length > 0}
-            <span class="muted-label" style="margin-left:10px">{groups.length} clips found</span>
+            <span class="muted-label" style="margin-left:10px">
+              {filteredGroups.length}{filteredGroups.length !== groups.length ? `/${groups.length}` : ''} clips
+            </span>
           {/if}
         </div>
         <div class="row-actions">
@@ -634,8 +662,40 @@
           <div class="empty-sub">Try enabling Deaths or adjusting settings</div>
         </div>
       {:else}
+        {#if allMaps.length > 0 || multiKillCount > 0}
+          <div class="filter-bar">
+            {#if allMaps.length > 0}
+              <div class="filter-bar-maps">
+                {#if allMaps.length > 1}
+                  <button class="map-chip" class:map-chip-active={mapFilter === 'all'} on:click={() => mapFilter = 'all'}>All</button>
+                {/if}
+                {#each allMaps as map}
+                  <button
+                    class="map-chip"
+                    class:map-chip-active={mapFilter === map.code || allMaps.length === 1}
+                    on:click={() => mapFilter = allMaps.length > 1 ? map.code : 'all'}
+                  >
+                    {#if mapIcons[map.code]}<img src={mapIcons[map.code]} alt="" class="map-chip-icon" />{/if}
+                    {map.display}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+            {#if multiKillCount > 0}
+              <button class="multikill-toggle" class:multikill-active={multiKillOnly} on:click={() => multiKillOnly = !multiKillOnly}>
+                Multi-kill
+              </button>
+            {/if}
+          </div>
+        {/if}
+        {#if filteredGroups.length === 0}
+          <div class="empty-state" style="flex:1">
+            <div class="empty-title">No clips match</div>
+            <div class="empty-sub">Try adjusting the filters above</div>
+          </div>
+        {/if}
         <div class="kill-feed">
-          {#each groups as group}
+          {#each filteredGroups as group}
             {@const checked = selectedGroups.has(group.out_name)}
             <div
               class="feed-row"
@@ -661,7 +721,9 @@
               <span class="badge" style={groupBadgeStyle(group)}>{@html groupBadgeContent(group)}</span>
               <div class="feed-info">
                 <div class="feed-name">{feedTitle(group)}</div>
-                <div class="feed-meta">{group.ts_label} · {fmtDuration(group.clip_duration)}</div>
+                <div class="feed-meta">
+                  {#if group.map_name}<span class="feed-map">{#if mapIcons[group.map_name]}<img src={mapIcons[group.map_name]} alt="" class="feed-map-icon" />{/if}{group.map_display || group.map_name}</span> · {/if}{group.ts_label} · {fmtDuration(group.clip_duration)}
+                </div>
               </div>
             </div>
           {/each}
@@ -942,8 +1004,9 @@ header {
   border: none;
   padding: 0;
   font-size: 10px;
+  cursor: pointer;
 }
-.path-field input:focus { border: none; }
+.path-field input:focus { border: none; outline: none; }
 .field-arrow {
   background: transparent;
   border: none;
@@ -953,6 +1016,7 @@ header {
   align-items: center;
   flex-shrink: 0;
 }
+.field-arrow:disabled { opacity: 0.3; cursor: default; }
 
 .sidebar-sep {
   height: 1px;
@@ -1162,6 +1226,66 @@ header {
   color: var(--muted);
   font-family: var(--font-mono);
 }
+
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  min-height: 0;
+}
+.filter-bar-maps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+}
+.map-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.map-chip:hover { border-color: var(--blue); color: var(--blue); }
+.map-chip-active { border-color: var(--blue) !important; background: rgba(79,158,255,0.12) !important; color: var(--blue) !important; }
+.map-chip-icon { width: 14px; height: 14px; object-fit: contain; flex-shrink: 0; }
+.multikill-toggle {
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.multikill-toggle:hover { border-color: var(--green); color: var(--green); }
+.multikill-active { border-color: var(--green) !important; background: rgba(0,229,160,0.12) !important; color: var(--green) !important; }
+
+.feed-map {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--blue);
+  font-family: var(--font-mono);
+}
+.feed-map-icon { width: 12px; height: 12px; object-fit: contain; flex-shrink: 0; }
 
 .kill-feed { flex: 1; overflow-y: auto; }
 

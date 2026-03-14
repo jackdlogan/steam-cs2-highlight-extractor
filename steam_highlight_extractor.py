@@ -36,8 +36,8 @@ from datetime import timedelta, datetime
 # STEAM_RECORDING_PATH = r"C:\Users\YourName\Videos\SteamRecordings"
 STEAM_RECORDING_PATH = None
 
-# Highlights will be saved here (default: SteamHighlights/ next to this script)
-OUTPUT_FOLDER = Path(__file__).parent / "SteamHighlights"
+# Highlights will be saved here (default: ~/Videos/SteamHighlights)
+OUTPUT_FOLDER = Path.home() / "Videos" / "SteamHighlights"
 
 # Seconds to include before the FIRST event and after the LAST event in a clip
 CLIP_PADDING_BEFORE = 1   # seconds before first event
@@ -105,36 +105,69 @@ def _find_ffmpeg():
 FFMPEG_BIN = _find_ffmpeg()
 
 
+_ENCODER_CACHE_PATH = Path.home() / ".config" / "steam_hl" / "encoder_cache.json"
+
+
+def _ffmpeg_version():
+    """Return ffmpeg version string, or empty string on failure."""
+    try:
+        no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        r = subprocess.run([FFMPEG_BIN, "-version"], capture_output=True,
+                           timeout=5, creationflags=no_window)
+        first_line = r.stdout.decode(errors="replace").splitlines()[0]
+        return first_line
+    except Exception:
+        return ""
+
+
 def _detect_gpu_encoder():
     """
     Probe ffmpeg for available GPU H.264 encoders.
-    Returns the first working encoder name, or None to fall back to libx264.
-    Tries NVIDIA NVENC → AMD AMF → Intel Quick Sync in order.
+    Result is cached to disk — probing only runs when ffmpeg version changes
+    or the cache is missing. Returns encoder name or None (→ libx264 fallback).
     """
     if not FFMPEG_BIN:
         return None
 
-    candidates = [
-        "h264_nvenc",   # NVIDIA NVENC
-        "h264_amf",     # AMD AMF / VCE
-        "h264_qsv",     # Intel Quick Sync
-    ]
+    ffmpeg_ver = _ffmpeg_version()
+
+    # Try reading cache
+    try:
+        cached = json.loads(_ENCODER_CACHE_PATH.read_text(encoding="utf-8"))
+        if cached.get("ffmpeg_version") == ffmpeg_ver:
+            return cached.get("encoder")  # may be None (no GPU encoder found)
+    except Exception:
+        pass  # cache missing or corrupt — probe fresh
+
+    # Probe each candidate
+    candidates = ["h264_nvenc", "h264_amf", "h264_qsv"]
     no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    found = None
     for enc in candidates:
         try:
             result = subprocess.run(
                 [FFMPEG_BIN, "-y",
                  "-f", "lavfi", "-i", "nullsrc=s=32x32:d=0.1",
-                 "-vframes", "1", "-c:v", enc,
-                 "-f", "null", "-"],
-                capture_output=True, timeout=10,
-                creationflags=no_window,
+                 "-vframes", "1", "-c:v", enc, "-f", "null", "-"],
+                capture_output=True, timeout=10, creationflags=no_window,
             )
             if result.returncode == 0:
-                return enc
+                found = enc
+                break
         except Exception:
             continue
-    return None
+
+    # Write cache
+    try:
+        _ENCODER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _ENCODER_CACHE_PATH.write_text(
+            json.dumps({"ffmpeg_version": ffmpeg_ver, "encoder": found}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass  # non-fatal — cache just won't persist
+
+    return found
 
 
 GPU_ENCODER = _detect_gpu_encoder()
@@ -206,12 +239,141 @@ def find_steam_recording_path():
         gr = uid_dir / "gamerecordings"
         if not gr.is_dir():
             continue
-        if any(gr.rglob("timeline_*.json")) or any(gr.rglob("session.mpd")):
+        if any(gr.glob("*/*/session.mpd")) or any(gr.glob("*/*/*/session.mpd")) \
+                or any(gr.glob("*/timeline_*.json")) or any(gr.glob("timelines/timeline_*.json")):
             return gr
     return None
 
 
 # ── Timeline parsing ──────────────────────────────────────────────────────────
+
+
+# Fallback display-name lookup for maps not seen in timeline tags.
+# code → display name
+CS2_MAP_NAMES = {
+    # Active Duty
+    "de_ancient":   "Ancient",
+    "de_anubis":    "Anubis",
+    "de_dust2":     "Dust II",
+    "de_inferno":   "Inferno",
+    "de_mirage":    "Mirage",
+    "de_nuke":      "Nuke",
+    "de_overpass":  "Overpass",
+    # Reserve / Competitive
+    "de_vertigo":   "Vertigo",
+    "de_train":     "Train",
+    "de_golden":    "Golden",
+    "de_basalt":    "Basalt",
+    "de_edin":      "Edin",
+    "de_palacio":   "Palacio",
+    "de_cache":     "Cache",
+    "de_cobblestone": "Cobblestone",
+    # Hostage
+    "cs_office":    "Office",
+    "cs_italy":     "Italy",
+    "cs_assault":   "Assault",
+    # Wingman-exclusive
+    "de_stmarc":    "St. Marc",
+    "de_lake":      "Lake",
+    "de_safehouse": "Safehouse",
+    "de_bank":      "Bank",
+    "de_rooftop":   "Rooftop",
+    "gd_rialto":    "Rialto",
+    # Arms Race
+    "ar_baggage":   "Baggage",
+    "ar_shoots":    "Shoots",
+    "ar_monastery": "Monastery",
+    "ar_dizzy":     "Dizzy",
+    # Misc / older
+    "de_austria":   "Austria",
+    "de_sugarcane": "Sugarcane",
+    "de_biome":     "Biome",
+}
+
+
+def parse_map_intervals(json_path, timeline_offset_sec=0.0):
+    """
+    Return a sorted list of (time_sec, map_code, display_name) tuples from
+    phase entries that carry a Map tag (e.g. icon="map_icon_de_ancient").
+    Used to assign the correct map to each clip when a session spans multiple maps.
+    """
+    intervals = []
+    try:
+        with open(json_path, "rb") as f:
+            data = json.loads(f.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return intervals
+
+    raw_entries = data.get("entries", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        time_val = entry.get("time")
+        if time_val is None:
+            continue
+        for tag in entry.get("tags", []):
+            if not isinstance(tag, dict):
+                continue
+            if tag.get("group", "").lower() == "map":
+                icon = tag.get("icon", "")
+                if icon.startswith("map_icon_"):
+                    map_code = icon[len("map_icon_"):]
+                    # Prefer the display name from the tag; fall back to lookup table
+                    display_name = tag.get("name", "") or CS2_MAP_NAMES.get(map_code, map_code)
+                    try:
+                        time_sec = float(time_val) / 1000.0 - timeline_offset_sec
+                        intervals.append((time_sec, map_code, display_name))
+                    except (ValueError, TypeError):
+                        pass
+                    break  # one map tag per entry is enough
+
+    return sorted(intervals)
+
+
+def _map_at(intervals, time_sec):
+    """Return (map_code, display_name) active at time_sec given sorted intervals."""
+    result_code, result_name = "", ""
+    for t, code, name in intervals:
+        if t <= time_sec:
+            result_code, result_name = code, name
+        else:
+            break
+    return result_code, result_name
+
+
+def parse_phase_times(json_path, timeline_offset_sec=0.0):
+    """
+    Return a sorted list of session-relative times (seconds) where a phase
+    change occurred (round start, freezetime, warmup, etc.).
+    These are used as hard round boundaries — kills on opposite sides of a
+    boundary are never merged into the same group.
+    """
+    times = []
+    try:
+        with open(json_path, "rb") as f:
+            data = json.loads(f.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return times
+
+    raw_entries = data.get("entries", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type", "") == "event":
+            continue  # skip kill/game events — we only want phase transitions
+        time_val = entry.get("time")
+        if time_val is None:
+            continue
+        try:
+            time_sec = float(time_val) / 1000.0 - timeline_offset_sec
+            times.append(time_sec)
+        except (ValueError, TypeError):
+            continue
+
+    return sorted(times)
+
 
 def parse_timeline_json(json_path, timeline_offset_sec=0.0):
     """
@@ -385,7 +547,10 @@ def export_clip(session_dir, start_sec, duration, output_path):
         cmd += ["-i", f"concat:{a_concat}"]
         cmd += ["-vf", vf, "-af", af]
     else:
-        cmd += ["-vf", vf, "-an"]
+        # No audio chunks — inject a silent stereo track so the output always
+        # has an audio stream (required for seamless concat filter during merge).
+        cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000"]
+        cmd += ["-vf", vf, "-af", f"atrim=duration={duration:.6f},asetpts=PTS-STARTPTS"]
     if GPU_ENCODER == "h264_nvenc":
         cmd += ["-c:v", "h264_nvenc", "-preset", "p4",
                 "-rc:v", "vbr", "-cq:v", "23"]
@@ -397,7 +562,7 @@ def export_clip(session_dir, start_sec, duration, output_path):
                 "-global_quality", "23"]
     else:
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
-    cmd += ["-c:a", "aac", "-movflags", "+faststart"]
+    cmd += ["-c:a", "aac", "-shortest", "-movflags", "+faststart"]
     cmd += [str(output_path)]
 
     if not FFMPEG_BIN:
@@ -485,6 +650,19 @@ def _is_kill_event(event):
     return any(kw in label for kw in KILL_EVENTS)
 
 
+def _is_self_kill(event):
+    """Return True for 'You killed yourself' — should never be grouped as a highlight."""
+    return "yourself" in event.get("label", "").lower()
+
+
+def _round_index(t, phase_times):
+    """Return which round interval time t falls into (0-based)."""
+    for i, boundary in enumerate(phase_times):
+        if t < boundary:
+            return i
+    return len(phase_times)
+
+
 def _parse_session_groups(session_dir):
     """
     Shared internal: parse a session directory and return (groups, error).
@@ -549,9 +727,21 @@ def _parse_session_groups(session_dir):
           f"(filename_offset={filename_offset:.1f}s + period_start={period_start:.1f}s)")
 
     all_events = []
+    phase_times = []
+    map_intervals = []
     for jf in json_files:
         events = parse_timeline_json(jf, timeline_offset_sec)
         all_events.extend(events)
+        phase_times.extend(parse_phase_times(jf, timeline_offset_sec))
+        map_intervals.extend(parse_map_intervals(jf, timeline_offset_sec))
+    phase_times = sorted(set(phase_times))
+    map_intervals = sorted(map_intervals)
+
+    if map_intervals:
+        unique_maps = list(dict.fromkeys(name for _, _, name in map_intervals))
+        print(f"  Maps: {', '.join(unique_maps)}")
+    else:
+        print(f"  Map: (not detected — check timeline entry types)")
 
     all_events = [e for e in all_events
                   if 0 <= e["time_sec"] <= session_duration]
@@ -565,45 +755,71 @@ def _parse_session_groups(session_dir):
     highlights = [e for e in all_events if is_interesting(e)]
 
     print(f"\nSession: {session_dir.name}")
-    print(f"   Found {len(all_events)} total events, {len(highlights)} highlights")
+    print(f"   Found {len(all_events)} total events, {len(highlights)} highlights, {len(phase_times)} round boundaries")
 
     if not highlights:
         print(f"   No kill/highlight events to extract.")
         return None, "no_highlights"
 
-    # ── Smart grouping: merge kills close together into multi-kill clips ──
+    # ── Grouping: one round = one clip ────────────────────────────────────────
     highlights.sort(key=lambda e: e["time_sec"])
+
+    # Filter self-kills before grouping
+    self_kills = [h for h in highlights if _is_self_kill(h)]
+    highlights  = [h for h in highlights if not _is_self_kill(h)]
+    for h in self_kills:
+        ts = f"{int(h['time_sec']//60)}m{int(h['time_sec']%60):02d}s"
+        print(f"     - skipped self-kill [{ts}] \"{h['label']}\"")
 
     groups = []
 
-    for h in highlights:
-        t = h["time_sec"]
-        placed = False
+    if phase_times:
+        # Round-based grouping: bucket every highlight by which round it falls in
+        buckets = {}
+        for h in highlights:
+            r = _round_index(h["time_sec"], phase_times)
+            buckets.setdefault(r, []).append(h)
 
-        for group in reversed(groups):
-            gap = t - group["end"]
-            window = MULTI_KILL_MERGE_WINDOW if (group["is_multikill"] or _is_kill_event(h)) else 15
-            if gap <= window:
-                group["events"].append(h)
-                group["end"] = t
-                group["is_multikill"] = group["is_multikill"] or (
-                    _is_kill_event(h) and any(_is_kill_event(e) for e in group["events"][:-1])
-                )
-                placed = True
-                break
-
-        if not placed:
+        for r in sorted(buckets):
+            evts = buckets[r]
             groups.append({
-                "events": [h],
-                "start": t,
-                "end": t,
+                "events": evts,
+                "start":  evts[0]["time_sec"],
+                "end":    evts[-1]["time_sec"],
                 "is_multikill": False,
             })
+
+        print(f"   Round-based grouping: {len(phase_times)} boundaries → {len(groups)} round group(s)")
+    else:
+        # Fallback when no phase data: merge window
+        print(f"   No round boundaries found — using {MULTI_KILL_MERGE_WINDOW}s merge window fallback")
+        for h in highlights:
+            t   = h["time_sec"]
+            ts  = f"{int(t//60)}m{int(t%60):02d}s"
+            placed = False
+            for group in reversed(groups):
+                gap    = t - group["end"]
+                window = MULTI_KILL_MERGE_WINDOW if (group["is_multikill"] or _is_kill_event(h)) else 15
+                if gap <= window:
+                    group["events"].append(h)
+                    group["end"] = t
+                    group["is_multikill"] = group["is_multikill"] or (
+                        _is_kill_event(h) and any(_is_kill_event(e) for e in group["events"][:-1])
+                    )
+                    placed = True
+                    print(f"     + merged  [{ts}] \"{h['label']}\"  gap={gap:.1f}s ≤ {window}s")
+                    break
+            if not placed:
+                groups.append({"events": [h], "start": t, "end": t, "is_multikill": False})
+                print(f"     + new grp [{ts}] \"{h['label']}\"" )
 
     for group in groups:
         kill_count = sum(1 for e in group["events"] if _is_kill_event(e))
         group["kill_count"] = kill_count
         group["is_multikill"] = kill_count >= 2
+        map_code, map_display = _map_at(map_intervals, group["start"])
+        group["map_name"]    = map_code
+        group["map_display"] = map_display
 
     print(f"   Grouped into {len(groups)} clip(s) "
           f"({sum(1 for g in groups if g['is_multikill'])} multi-kill)\n")
@@ -661,31 +877,43 @@ def scan_session_groups(session_dir, output_folder):
 
 def merge_clips(clip_paths, output_path):
     """
-    Concatenate a list of MP4 files into one output file.
-    Uses ffmpeg concat demuxer with stream copy — no re-encode, very fast.
+    Concatenate a list of MP4 files into one seamless output file.
+    Uses the ffmpeg concat filter (frame-accurate, no PTS drift between clips)
+    with full re-encode. All input clips must have both video and audio streams
+    — export_clip guarantees this by injecting silent audio when needed.
     Returns True on success, False on failure.
     """
     if not FFMPEG_BIN:
         print("  ERROR: ffmpeg not found.")
         return False
 
-    import tempfile
-    list_file = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        ) as f:
-            for p in clip_paths:
-                f.write(f"file '{str(p).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
-            list_file = f.name
+    n = len(clip_paths)
+    if n < 2:
+        print("  WARNING: merge requires at least 2 clips.")
+        return False
 
+    try:
         no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-f", "concat", "-safe", "0", "-i", list_file,
-            "-c", "copy", "-movflags", "+faststart",
-            str(output_path),
-        ]
+
+        cmd = [FFMPEG_BIN, "-y"]
+        for p in clip_paths:
+            cmd += ["-i", str(p)]
+
+        streams = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+        # Pipe concat audio through aformat to normalise sample rate/layout
+        # before AAC encoding — mixed rates (e.g. 44100 vs 48000) cause -22.
+        filter_complex = (
+            f"{streams}concat=n={n}:v=1:a=1[v][a_raw];"
+            f"[a_raw]aformat=sample_rates=48000:channel_layouts=stereo:sample_fmts=fltp[a]"
+        )
+        cmd += ["-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]"]
+
+        # Always use libx264 for merge — GPU encoders (QSV/NVENC/AMF) require
+        # hardware surface input and can't directly consume a software concat
+        # filter graph, causing "Invalid argument" errors on some drivers.
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+        cmd += ["-c:a", "aac", "-movflags", "+faststart", str(output_path)]
+
         result = subprocess.run(cmd, capture_output=True, timeout=600,
                                 creationflags=no_window)
         if result.returncode != 0:
@@ -702,12 +930,6 @@ def merge_clips(clip_paths, output_path):
     except (FileNotFoundError, TypeError):
         print("  ERROR: ffmpeg not found.")
         return False
-    finally:
-        if list_file:
-            try:
-                os.unlink(list_file)
-            except Exception:
-                pass
 
 
 def _group_events_into_segments(events, threshold):
@@ -729,7 +951,7 @@ def _group_events_into_segments(events, threshold):
     return segments
 
 
-def export_single_group(group, stop_event=None):
+def export_single_group(group, stop_event=None, force=False):
     """
     Export one enriched group dict produced by scan_session_groups.
 
@@ -743,7 +965,7 @@ def export_single_group(group, stop_event=None):
         True       — export succeeded
         False      — export failed
     """
-    if group["out_path"].exists():
+    if not force and group["out_path"].exists():
         return "skipped"
     if stop_event and stop_event.is_set():
         return "stopped"
@@ -751,6 +973,13 @@ def export_single_group(group, stop_event=None):
     events = sorted(group["events"], key=lambda e: e["time_sec"])
     pre_shift = KILL_EVENT_PRE_SHIFT if group["kill_count"] > 0 else 0
     segments = _group_events_into_segments(events, JUMP_CUT_THRESHOLD)
+
+    if len(segments) > 1:
+        print(f"    Jump-cut: {group['kill_count']}K group split into {len(segments)} segment(s) "
+              f"(threshold={JUMP_CUT_THRESHOLD}s):")
+        for i, seg in enumerate(segments):
+            times = ", ".join(f"{int(e['time_sec']//60)}m{int(e['time_sec']%60):02d}s" for e in seg)
+            print(f"      seg {i+1}: [{times}]  ({len(seg)} kill(s))")
 
     if len(segments) == 1:
         # No jump cuts needed — single continuous clip
@@ -860,12 +1089,24 @@ def process_session(session_dir, output_folder, stop_event=None):
 
 
 def find_all_sessions(root):
+    """
+    Find all session directories under root.
+    Steam's structure is always root/<game_id>/<session>/session.mpd,
+    so we search exactly 2 and 3 levels deep instead of rglob-ing everything.
+    """
+    seen = set()
     sessions = []
-    for p in root.rglob("session.mpd"):
-        # Skip sessions inside clips/ subdirectory — those are already-extracted clips
-        if "clips" in p.parts:
-            continue
-        sessions.append(p.parent)
+    # Covers: root/session/session.mpd  (flat)
+    #         root/game_id/session/session.mpd  (standard Steam layout)
+    #         root/game_id/sub/session/session.mpd  (occasional extra nesting)
+    for pattern in ("*/session.mpd", "*/*/session.mpd", "*/*/*/session.mpd"):
+        for p in root.glob(pattern):
+            if "clips" in p.parts:
+                continue
+            session_dir = p.parent
+            if session_dir not in seen:
+                seen.add(session_dir)
+                sessions.append(session_dir)
     return sessions
 
 
