@@ -40,7 +40,7 @@ STEAM_RECORDING_PATH = None
 OUTPUT_FOLDER = Path(__file__).parent / "SteamHighlights"
 
 # Seconds to include before the FIRST event and after the LAST event in a clip
-CLIP_PADDING_BEFORE = 10  # seconds before first event
+CLIP_PADDING_BEFORE = 1   # seconds before first event
 CLIP_PADDING_AFTER  = 5   # seconds after last event
 
 # CS2 kill events are logged at the moment of death confirmation, which is
@@ -51,6 +51,14 @@ KILL_EVENT_PRE_SHIFT = 3  # extra seconds to rewind for kill events (0 to disabl
 # Events within this many seconds of each other are merged into ONE clip.
 # e.g. 3 kills at 0:32, 0:38, 0:45 → single multi-kill clip
 MULTI_KILL_MERGE_WINDOW = 45  # seconds
+
+# Set to True to also extract clips where you died
+INCLUDE_DEATH_HIGHLIGHTS = False
+
+# If two consecutive events within a group are more than this many seconds apart,
+# export them as separate sub-clips and jump-cut them together instead of one long clip.
+# Set to 0 to disable.
+JUMP_CUT_THRESHOLD = 15  # seconds
 
 # Kill-type events — these are grouped aggressively into multi-kill clips
 KILL_EVENTS = [
@@ -268,13 +276,10 @@ def is_interesting(event):
     if "you killed" in title or "kill" in icon:
         return True
 
-    # --- Other events (disabled for now, enable later) ---
-    # # Death: "You were killed by X"
-    # if "you were killed" in title or icon == "cs2_death":
-    #     return True
-    # # Other highlights by title keywords
-    # if any(kw in title for kw in ["ace", "clutch", "mvp", "defused", "1v"]):
-    #     return True
+    # Death: "You were killed by X"
+    if INCLUDE_DEATH_HIGHLIGHTS:
+        if "you were killed" in title or "death" in icon:
+            return True
 
     return False
 
@@ -705,9 +710,32 @@ def merge_clips(clip_paths, output_path):
                 pass
 
 
+def _group_events_into_segments(events, threshold):
+    """
+    Split a sorted list of events into segments where the gap between
+    consecutive events exceeds `threshold` seconds.
+    Returns a list of lists (each inner list is one segment of events).
+    """
+    if not events or threshold <= 0:
+        return [events]
+    segments, current = [], [events[0]]
+    for e in events[1:]:
+        if e["time_sec"] - current[-1]["time_sec"] > threshold:
+            segments.append(current)
+            current = [e]
+        else:
+            current.append(e)
+    segments.append(current)
+    return segments
+
+
 def export_single_group(group, stop_event=None):
     """
     Export one enriched group dict produced by scan_session_groups.
+
+    If JUMP_CUT_THRESHOLD > 0 and any two consecutive events within the group
+    are more than that many seconds apart, each segment is exported as a
+    separate sub-clip and then jump-cut together into the final file.
 
     Returns:
         "skipped"  — output file already exists
@@ -719,13 +747,39 @@ def export_single_group(group, stop_event=None):
         return "skipped"
     if stop_event and stop_event.is_set():
         return "stopped"
-    success = export_clip(
-        group["session_dir"],
-        group["clip_start"],
-        group["clip_duration"],
-        group["out_path"],
-    )
-    return True if success else False
+
+    events = sorted(group["events"], key=lambda e: e["time_sec"])
+    pre_shift = KILL_EVENT_PRE_SHIFT if group["kill_count"] > 0 else 0
+    segments = _group_events_into_segments(events, JUMP_CUT_THRESHOLD)
+
+    if len(segments) == 1:
+        # No jump cuts needed — single continuous clip
+        return True if export_clip(
+            group["session_dir"],
+            group["clip_start"],
+            group["clip_duration"],
+            group["out_path"],
+        ) else False
+
+    # Multiple segments — export each to a temp file then merge
+    import tempfile
+    tmp_dir = Path(tempfile.mkdtemp(prefix="steamhl_"))
+    tmp_clips = []
+    try:
+        for i, seg in enumerate(segments):
+            if stop_event and stop_event.is_set():
+                return "stopped"
+            seg_start = max(0.0, seg[0]["time_sec"] - CLIP_PADDING_BEFORE - pre_shift)
+            seg_end   = seg[-1]["time_sec"] + CLIP_PADDING_AFTER + pre_shift
+            tmp_path  = tmp_dir / f"seg_{i:03d}.mp4"
+            if not export_clip(group["session_dir"], seg_start, seg_end - seg_start, tmp_path):
+                return False
+            tmp_clips.append(tmp_path)
+
+        print(f"    Jump-cutting {len(tmp_clips)} segments together…")
+        return merge_clips(tmp_clips, group["out_path"])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def process_session(session_dir, output_folder, stop_event=None):

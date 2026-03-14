@@ -2,6 +2,30 @@
   import { onMount } from 'svelte'
   import { open as openDialog } from '@tauri-apps/plugin-dialog'
   import { getStatus, getDefaults, getSessions, stopExport, openOutput, streamPost } from './lib/api.js'
+  import killIconRaw  from './assets/kill-icon.svg?raw'
+  import deathIconRaw from './assets/death-icon.svg?raw'
+
+  function prepIcon(raw, color, size = 12) {
+    return raw
+      .replace(/\s+width="[^"]*"/, ` width="${size}"`)
+      .replace(/\s+height="[^"]*"/, ` height="${size}"`)
+      .replace(/fill="#000000"/g, `fill="${color}"`)
+  }
+
+  const killIconGrey   = prepIcon(killIconRaw,  '#94a3b8', 11)
+  const deathIconRed   = prepIcon(deathIconRaw, '#ff6b6b', 12)
+
+  const killIconGreen = prepIcon(killIconRaw, '#00e5a0', 12)
+  const killIconBlue  = prepIcon(killIconRaw, '#4f9eff', 12)
+  const killIconRed   = prepIcon(killIconRaw, '#ff6b6b', 12)
+  const killIconGold  = prepIcon(killIconRaw, '#f0c040', 12)
+
+  function killIconForCount(n) {
+    if (n >= 5) return killIconGold
+    if (n >= 4) return killIconRed
+    if (n >= 2) return killIconBlue
+    return killIconGreen
+  }
 
   // ── Server / init state ────────────────────────────────────────────
   let serverOk    = false
@@ -12,13 +36,15 @@
   // ── Config ─────────────────────────────────────────────────────────
   let recordingPath = ''
   let outputFolder  = ''
-  let padBefore     = 10
+  let padBefore     = 1
   let padAfter      = 5
   let preShift      = 3
   let mergeWindow   = 45
   let extractKills  = true
   let extractDeaths = false
   let doMerge       = false
+  let workers       = 1
+  let lastApplied   = null   // config snapshot from last scan
 
   // ── Sessions ───────────────────────────────────────────────────────
   let sessions         = []
@@ -45,6 +71,8 @@
   $: multiKillCount    = groups.filter(g => g.tag !== 'KILL' && g.tag !== 'DEATH').length
   $: busy              = phase === 'scanning' || phase === 'exporting'
   $: currentClipNum    = exportTotal > 0 ? Math.min(Math.ceil(progress * exportTotal), exportTotal) : 0
+  $: scanConfig        = { padBefore, padAfter, preShift, mergeWindow, extractKills, extractDeaths }
+  $: settingsDirty     = lastApplied !== null && JSON.stringify(scanConfig) !== JSON.stringify(lastApplied)
 
   function config() {
     return {
@@ -72,6 +100,7 @@
         serverOk    = status.ok
         ffmpegFound = status.ffmpeg_found
         gpuEncoder  = status.gpu_encoder || null
+        workers     = gpuEncoder ? 3 : 1
         if (serverOk) {
           await loadDefaults()
           return
@@ -87,7 +116,7 @@
       const d = await getDefaults()
       recordingPath = d.recording_path || ''
       outputFolder  = d.output_folder  || ''
-      padBefore     = d.pad_before     ?? 10
+      padBefore     = d.pad_before     ?? 1
       padAfter      = d.pad_after      ?? 5
       preShift      = d.pre_shift      ?? 3
       mergeWindow   = d.merge_window   ?? 45
@@ -213,8 +242,9 @@
       } else if (event.type === 'progress') {
         progress = event.value
       } else if (event.type === 'done') {
-        phase    = groups.length > 0 ? 'results' : 'idle'
-        progress = 1
+        phase       = groups.length > 0 ? 'results' : 'idle'
+        progress    = 1
+        lastApplied = { ...scanConfig }
       } else if (event.type === 'error') {
         logs  = [...logs, { text: 'Error: ' + event.message, level: 'err' }]
         phase = 'results'
@@ -229,6 +259,12 @@
     groups         = []
     selectedGroups = new Set()
     await scanNewSessions([...selectedSessions])
+  }
+
+  // Apply settings: re-scan selected sessions with current config
+  async function applySettings() {
+    if (selectedSessions.size === 0 || busy) return
+    await onScan()
   }
 
   // ── Export ─────────────────────────────────────────────────────────
@@ -252,9 +288,10 @@
     }))
 
     await streamPost('/api/export', {
-      groups: selectedGroupList,
-      config: config(),
-      merge:  doMerge,
+      groups:   selectedGroupList,
+      config:   config(),
+      merge:    doMerge,
+      workers:  workers,
     }, (event) => {
       if (event.type === 'log') {
         logs = [...logs, { text: event.text, level: event.level }]
@@ -315,18 +352,55 @@
   }
 
   // ── Helpers ────────────────────────────────────────────────────────
+  // ── Badge helpers for kill feed (use full group object) ────────────
+  function groupIsDeath(group) {
+    return (group.kill_count || 0) === 0
+  }
+
+  function groupBadgeStyle(group) {
+    if (groupIsDeath(group))
+      return `background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.35);color:#ff6b6b`
+    const n = group.kill_count || 1
+    if (n >= 5) return `background:rgba(240,192,64,0.15);border:1px solid rgba(240,192,64,0.4);color:#f0c040`
+    if (n >= 4) return `background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.35);color:#ff6b6b`
+    if (n >= 2) return `background:rgba(79,158,255,0.12);border:1px solid rgba(79,158,255,0.35);color:#4f9eff`
+    return `background:rgba(0,229,160,0.10);border:1px solid rgba(0,229,160,0.3);color:#00e5a0`
+  }
+
+  function groupBadgeContent(group) {
+    if (groupIsDeath(group))
+      return `<span class="badge-icon">${deathIconRed}</span>`
+    const n = Math.min(group.kill_count || 1, 5)
+    const icon = killIconForCount(n)
+    return Array.from({ length: n }, () =>
+      `<span class="badge-icon">${icon}</span>`
+    ).join('')
+  }
+
+  function feedTitle(group) {
+    if (!group.events?.length) return group.ts_label
+    return group.events.map(e => e.label || '').join(' → ')
+  }
+
+  // ── Badge helpers for export clip cards (tag string only) ───────────
   function badgeStyle(tag) {
-    const map = {
-      ACE:   { bg: 'rgba(240,192,64,0.15)',  bd: 'rgba(240,192,64,0.4)',  fg: '#f0c040' },
-      '5K':  { bg: 'rgba(240,192,64,0.15)',  bd: 'rgba(240,192,64,0.4)',  fg: '#f0c040' },
-      '4K':  { bg: 'rgba(255,107,107,0.12)', bd: 'rgba(255,107,107,0.35)',fg: '#ff6b6b' },
-      '3K':  { bg: 'rgba(79,158,255,0.12)',  bd: 'rgba(79,158,255,0.35)', fg: '#4f9eff' },
-      '2K':  { bg: 'rgba(79,158,255,0.12)',  bd: 'rgba(79,158,255,0.35)', fg: '#4f9eff' },
-      KILL:  { bg: 'rgba(0,229,160,0.10)',   bd: 'rgba(0,229,160,0.3)',   fg: '#00e5a0' },
-      DEATH: { bg: 'rgba(148,163,184,0.10)', bd: 'rgba(148,163,184,0.3)', fg: '#94a3b8' },
-    }
-    const s = map[tag] || { bg: '#2a3347', bd: '#2a3347', fg: '#e2e8f0' }
-    return `background:${s.bg};border:1px solid ${s.bd};color:${s.fg}`
+    const t = (tag || '').toUpperCase()
+    if (t === 'DEATH') return `background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.35);color:#ff6b6b`
+    const m = t.match(/^(\d+)K$/)
+    if (!m) return `background:#2a3347;border:1px solid #2a3347;color:#e2e8f0`
+    const n = parseInt(m[1])
+    if (n >= 5) return `background:rgba(240,192,64,0.15);border:1px solid rgba(240,192,64,0.4);color:#f0c040`
+    if (n >= 4) return `background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.35);color:#ff6b6b`
+    if (n >= 2) return `background:rgba(79,158,255,0.12);border:1px solid rgba(79,158,255,0.35);color:#4f9eff`
+    return `background:rgba(0,229,160,0.10);border:1px solid rgba(0,229,160,0.3);color:#00e5a0`
+  }
+
+  function badgeContent(tag) {
+    const t = (tag || '').toUpperCase()
+    if (t === 'DEATH') return `<span class="badge-icon">${deathIconRed}</span>`
+    const m = t.match(/^(\d+)K$/)
+    if (m) return `${m[1]}<span class="badge-icon">${killIconGrey}</span>`
+    return tag
   }
 
   function levelClass(level) {
@@ -463,6 +537,40 @@
           <span class="setting-val">{mergeWindow}s</span>
         </div>
       </div>
+      <div class="setting-row">
+        <span class="setting-label">Export workers{gpuEncoder ? ' (GPU)' : ''}</span>
+        <div class="setting-control">
+          <input type="range" bind:value={workers} min="1" max="4" step="1" />
+          <span class="setting-val">{workers}</span>
+        </div>
+      </div>
+
+      <!-- Rescan button at the bottom of settings -->
+      <button
+        class="btn-apply"
+        class:btn-apply-dirty={settingsDirty}
+        disabled={busy || selectedSessions.size === 0}
+        on:click={applySettings}
+        title={settingsDirty ? 'Re-scan selected sessions with new settings' : 'Settings match current scan'}
+      >
+        {#if busy && settingsDirty}
+          <svg class="apply-spin" width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.5" stroke-dasharray="18 9" stroke-linecap="round"/>
+          </svg>
+          Rescanning…
+        {:else if settingsDirty}
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <path d="M10 2.8A5 5 0 1 0 10.9 6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M10.5 1.5V4.5H7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Rescan with new settings
+        {:else}
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Settings applied
+        {/if}
+      </button>
     </div>
 
     <div class="sidebar-sep"></div>
@@ -473,12 +581,12 @@
         class="pill-toggle"
         class:pill-on={extractKills}
         on:click={() => extractKills = !extractKills}
-      >Kills</button>
+      >{@html killIconGreen}<span>Kills</span></button>
       <button
-        class="pill-toggle"
+        class="pill-toggle pill-toggle-death"
         class:pill-on={extractDeaths}
         on:click={() => extractDeaths = !extractDeaths}
-      >Deaths</button>
+      >{@html deathIconRed}<span>Deaths</span></button>
     </div>
 
   </aside>
@@ -550,9 +658,9 @@
               {:else}
                 <div class="feed-thumb feed-thumb-ph"></div>
               {/if}
-              <span class="badge" style={badgeStyle(group.tag)}>{group.tag}</span>
+              <span class="badge" style={groupBadgeStyle(group)}>{@html groupBadgeContent(group)}</span>
               <div class="feed-info">
-                <div class="feed-name">{group.out_name}</div>
+                <div class="feed-name">{feedTitle(group)}</div>
                 <div class="feed-meta">{group.ts_label} · {fmtDuration(group.clip_duration)}</div>
               </div>
             </div>
@@ -588,7 +696,7 @@
             {:else}
               <div class="card-thumb card-thumb-ph"></div>
             {/if}
-            <span class="badge" style={badgeStyle(card.tag)}>{card.tag}</span>
+            <span class="badge" style={badgeStyle(card.tag)}>{@html badgeContent(card.tag)}</span>
             <div class="card-info">
               <div class="card-name">{card.name}</div>
               <div class="card-meta">{fmtDuration(card.duration)}</div>
@@ -766,6 +874,19 @@ header {
 .status-text { color: var(--muted); }
 .status-sep  { color: var(--border); }
 .ffmpeg-ok   { color: var(--muted); }
+.badge-icon {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 2px;
+  vertical-align: middle;
+}
+.badge-icon:first-child { margin-left: 0; }
+.badge-icon svg {
+  width: 11px;
+  height: 11px;
+  display: block;
+}
+
 .gpu-badge {
   color: var(--green);
   background: rgba(0,229,160,0.08);
@@ -963,6 +1084,9 @@ header {
 }
 
 .pill-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   padding: 5px 12px;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -972,11 +1096,20 @@ header {
   cursor: pointer;
   transition: all 0.12s;
 }
+.pill-toggle svg {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+}
 .pill-toggle:hover { border-color: var(--blue); color: var(--text); }
 .pill-on {
   background: rgba(79,158,255,0.08);
   border-color: var(--blue);
   color: var(--text);
+}
+.pill-toggle-death.pill-on {
+  background: rgba(255,107,107,0.08);
+  border-color: var(--red);
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */
@@ -1429,6 +1562,45 @@ footer {
 /* Status / done */
 .status-ok   { color: var(--green); font-weight: 600; font-size: 12px; }
 .status-warn { color: var(--yellow); font-weight: 600; font-size: 12px; }
+
+/* ── Apply / Rescan button ───────────────────────────────────────── */
+.btn-apply {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: calc(100% - 28px);
+  margin: 8px 14px 4px;
+  padding: 7px 0;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, opacity 0.15s;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+.btn-apply:not(:disabled):hover {
+  background: var(--border);
+  color: var(--text);
+}
+.btn-apply-dirty {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #000;
+}
+.btn-apply-dirty:not(:disabled):hover {
+  background: #79b4ff;
+  border-color: #79b4ff;
+}
+@keyframes apply-spin {
+  to { transform: rotate(360deg); }
+}
+.apply-spin {
+  animation: apply-spin 0.9s linear infinite;
+}
 
 /* ── Micro button ────────────────────────────────────────────────── */
 .micro {

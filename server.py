@@ -16,6 +16,7 @@ import threading
 import asyncio
 import time
 import tempfile
+import concurrent.futures
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -28,7 +29,7 @@ import steam_highlight_extractor as core
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Steam Highlight Extractor", version="2.0.1")
+app = FastAPI(title="Steam Highlight Extractor", version="2.0.2")
 
 _thumbnail_dir = Path(tempfile.gettempdir()) / "steam_hl_thumbs"
 
@@ -48,12 +49,13 @@ _stop_event: threading.Event = threading.Event()
 class Config(BaseModel):
     recording_path: str = ""
     output_folder:  str = str(core.OUTPUT_FOLDER)
-    pad_before:     int = core.CLIP_PADDING_BEFORE
-    pad_after:      int = core.CLIP_PADDING_AFTER
-    pre_shift:      int = core.KILL_EVENT_PRE_SHIFT
-    merge_window:   int = core.MULTI_KILL_MERGE_WINDOW
-    extract_kills:  bool = True
-    extract_deaths: bool = False
+    pad_before:         int  = core.CLIP_PADDING_BEFORE
+    pad_after:          int  = core.CLIP_PADDING_AFTER
+    pre_shift:          int  = core.KILL_EVENT_PRE_SHIFT
+    merge_window:       int  = core.MULTI_KILL_MERGE_WINDOW
+    jump_cut_threshold: int  = core.JUMP_CUT_THRESHOLD
+    extract_kills:      bool = True
+    extract_deaths:     bool = False
 
 
 class ScanRequest(BaseModel):
@@ -62,9 +64,10 @@ class ScanRequest(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    groups: list[dict]      # serialised group dicts (out_path/session_dir as strings)
-    config: Config
-    merge:  bool = False
+    groups:  list[dict]      # serialised group dicts (out_path/session_dir as strings)
+    config:  Config
+    merge:   bool = False
+    workers: int  = 1
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
@@ -117,6 +120,7 @@ def _apply_config(cfg: Config):
     core.CLIP_PADDING_AFTER      = cfg.pad_after
     core.KILL_EVENT_PRE_SHIFT    = cfg.pre_shift
     core.MULTI_KILL_MERGE_WINDOW = cfg.merge_window
+    core.JUMP_CUT_THRESHOLD      = cfg.jump_cut_threshold
 
     want_kills  = cfg.extract_kills
     want_deaths = cfg.extract_deaths
@@ -276,67 +280,78 @@ def export_groups(req: ExportRequest):
     def _run():
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = sys.stderr = _QueueWriter(q)
-        exported_paths = []   # all clips to include in merge
-        new_paths      = []   # only clips we just created (can be deleted after merge)
+        exported_by_idx = {}  # i -> out_path, kept in original order for merge
+        new_paths       = []  # only clips we just created (deleted after merge)
+        workers_count   = max(1, min(req.workers, total))
         try:
-            for i, group in enumerate(groups, 1):
-                if _stop_event.is_set():
-                    q.put({"type": "log",
-                           "text": f"\n  Stopped at clip {i}/{total}.\n",
-                           "level": "warn"})
-                    q.put({"type": "done", "stopped": True})
-                    return
-
-                q.put({"type": "progress",
-                       "value":   (i - 1) / total,
-                       "current": i - 1,
-                       "total":   total})
-
+            def _do_one(i, group):
+                """Run one export in a thread pool worker."""
                 out_name  = group.get("out_name", "?")
                 safe_name = out_name.encode("ascii", errors="replace").decode("ascii")
-
                 q.put({"type": "clip_start",
                        "index": i, "total": total, "name": safe_name,
                        "tag": group.get("tag", ""), "duration": group.get("clip_duration", 0)})
-
                 t0 = time.time()
                 try:
                     result = core.export_single_group(group, stop_event=_stop_event)
                 except Exception as exc:
-                    q.put({"type": "log",
-                           "text": f"\nERROR: {exc}\n", "level": "err"})
-                    result = False
-                elapsed = round(time.time() - t0, 1)
+                    return i, group, safe_name, False, round(time.time() - t0, 1), str(exc)
+                return i, group, safe_name, result, round(time.time() - t0, 1), None
 
-                if result == "skipped":
-                    q.put({"type": "log",
-                           "text":  f"  [{i}/{total}] Already exists: {safe_name}\n",
-                           "level": "info"})
-                    q.put({"type": "clip_done",
-                           "index": i, "status": "skipped", "size_mb": 0, "elapsed": elapsed})
-                    exported_paths.append(group["out_path"])
-                elif result == "stopped":
-                    q.put({"type": "clip_done",
-                           "index": i, "status": "stopped", "size_mb": 0, "elapsed": elapsed})
-                    q.put({"type": "done", "stopped": True})
-                    return
-                elif result is True:
-                    out_path = group["out_path"]
-                    exported_paths.append(out_path)
-                    new_paths.append(out_path)
-                    size_mb = round(out_path.stat().st_size / 1_000_000, 1) if out_path.exists() else 0
-                    label = "Rendered" if do_merge else "Saved"
-                    q.put({"type": "log",
-                           "text":  f"  [{i}/{total}] {label}: {safe_name}  ({size_mb} MB)\n",
-                           "level": "ok" if not do_merge else "info"})
-                    q.put({"type": "clip_done",
-                           "index": i, "status": "ok", "size_mb": size_mb, "elapsed": elapsed})
-                else:
-                    q.put({"type": "log",
-                           "text":  f"  [{i}/{total}] Failed: {safe_name}\n",
-                           "level": "err"})
-                    q.put({"type": "clip_done",
-                           "index": i, "status": "failed", "size_mb": 0, "elapsed": elapsed})
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers_count) as executor:
+                futures = {executor.submit(_do_one, i, group): i
+                           for i, group in enumerate(groups, 1)}
+
+                completed = 0
+                stopped   = False
+                for future in concurrent.futures.as_completed(futures):
+                    i, group, safe_name, result, elapsed, exc_msg = future.result()
+                    completed += 1
+
+                    if exc_msg:
+                        q.put({"type": "log",
+                               "text": f"\nERROR: {exc_msg}\n", "level": "err"})
+
+                    q.put({"type": "progress",
+                           "value":   completed / total,
+                           "current": completed,
+                           "total":   total})
+
+                    if result == "skipped":
+                        q.put({"type": "log",
+                               "text":  f"  [{i}/{total}] Already exists: {safe_name}\n",
+                               "level": "info"})
+                        q.put({"type": "clip_done",
+                               "index": i, "status": "skipped", "size_mb": 0, "elapsed": elapsed})
+                        exported_by_idx[i] = group["out_path"]
+                    elif result == "stopped":
+                        q.put({"type": "clip_done",
+                               "index": i, "status": "stopped", "size_mb": 0, "elapsed": elapsed})
+                        stopped = True
+                    elif result is True:
+                        out_path = group["out_path"]
+                        exported_by_idx[i] = out_path
+                        new_paths.append(out_path)
+                        size_mb = round(out_path.stat().st_size / 1_000_000, 1) if out_path.exists() else 0
+                        label = "Rendered" if do_merge else "Saved"
+                        q.put({"type": "log",
+                               "text":  f"  [{i}/{total}] {label}: {safe_name}  ({size_mb} MB)\n",
+                               "level": "ok" if not do_merge else "info"})
+                        q.put({"type": "clip_done",
+                               "index": i, "status": "ok", "size_mb": size_mb, "elapsed": elapsed})
+                    else:
+                        q.put({"type": "log",
+                               "text":  f"  [{i}/{total}] Failed: {safe_name}\n",
+                               "level": "err"})
+                        q.put({"type": "clip_done",
+                               "index": i, "status": "failed", "size_mb": 0, "elapsed": elapsed})
+
+            if stopped:
+                q.put({"type": "done", "stopped": True})
+                return
+
+            # Merge in original clip order
+            exported_paths = [exported_by_idx[i] for i in sorted(exported_by_idx)]
 
             # Merge
             if do_merge and len(exported_paths) > 1:
