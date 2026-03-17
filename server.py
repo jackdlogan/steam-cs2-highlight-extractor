@@ -216,6 +216,8 @@ def scan_sessions(req: ScanRequest):
         try:
             for idx, session in enumerate(selected):
                 q.put({"type": "progress", "value": idx / total if total else 0})
+
+                # ── Kill / death highlights ────────────────────────────
                 try:
                     groups = core.scan_session_groups(session, output_dir)
                 except Exception as exc:
@@ -223,20 +225,20 @@ def scan_sessions(req: ScanRequest):
                            "text": f"\nERROR scanning {session.name}: {exc}\n",
                            "level": "err"})
                     groups = None
-                if not groups:
-                    continue
-                for group in groups:
-                    group["session_name"] = session.name
-                    thumb = core.extract_thumbnail(
-                        group["session_dir"],
-                        group["clip_start"],
-                        group["clip_duration"],
-                        group["out_name"],
-                        _thumbnail_dir,
-                    )
-                    if thumb:
-                        group["thumbnail_file"] = thumb.name
-                    q.put({"type": "group", "data": _serialize_group(group)})
+                if groups:
+                    for group in groups:
+                        group["session_name"] = session.name
+                        thumb = core.extract_thumbnail(
+                            group["session_dir"],
+                            group["clip_start"],
+                            group["clip_duration"],
+                            group["out_name"],
+                            _thumbnail_dir,
+                        )
+                        if thumb:
+                            group["thumbnail_file"] = thumb.name
+                        q.put({"type": "group", "data": _serialize_group(group)})
+
             q.put({"type": "progress", "value": 1.0})
             q.put({"type": "done"})
         except Exception as exc:
@@ -417,6 +419,59 @@ def get_thumbnail(filename: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(str(path), media_type="image/jpeg")
+
+
+@app.get("/api/session-stream/{session_name}/{filename}")
+def serve_session_file(session_name: str, filename: str, recording_path: str = Query(default="")):
+    """
+    Serve DASH manifest and segment files for in-app preview.
+    Allows dash.js to stream a session directly without exporting first.
+
+    For the .mpd manifest: rewrites relative segment URLs to absolute so that
+    dash.js requests always include the recording_path query parameter (which
+    would otherwise be stripped when resolving relative URLs).
+
+    Security: session_name must not contain path traversal; filename is
+    validated against the exact patterns Steam uses.
+    """
+    import re as _re
+    from urllib.parse import quote
+    if ".." in session_name or "/" in session_name or "\\" in session_name:
+        raise HTTPException(status_code=400, detail="Invalid session name")
+    if not _re.match(r"^(session\.mpd|init-stream\d+\.m4s|chunk-stream\d+-\d{5}\.m4s)$", filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    root = Path(recording_path) if recording_path else core.find_steam_recording_path()
+    if not root or not root.exists():
+        raise HTTPException(status_code=404, detail="Recording path not found")
+
+    sessions = {s.name: s for s in core.find_all_sessions(root)}
+    if session_name not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    file_path = sessions[session_name] / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if filename.endswith(".mpd"):
+        # Rewrite relative segment URLs → absolute, baking in recording_path.
+        # dash.js resolves relative URLs from the MPD base directory, which
+        # strips the ?recording_path= query param — this patch fixes that.
+        content = file_path.read_text(encoding="utf-8")
+        base    = f"http://127.0.0.1:7847/api/session-stream/{quote(session_name, safe='')}"
+        rp      = quote(recording_path, safe="")
+
+        def _make_absolute(m):
+            attr, val = m.group(1), m.group(2)
+            if val.startswith("http"):  # already absolute, leave it
+                return m.group(0)
+            return f'{attr}="{base}/{val}?recording_path={rp}"'
+
+        content = _re.sub(r'(media|initialization)="([^"]+\.m4s[^"]*)"', _make_absolute, content)
+        from fastapi.responses import Response as _Resp
+        return _Resp(content=content.encode("utf-8"), media_type="application/dash+xml")
+
+    return FileResponse(str(file_path), media_type="video/mp4")
 
 
 @app.post("/api/open-output")
