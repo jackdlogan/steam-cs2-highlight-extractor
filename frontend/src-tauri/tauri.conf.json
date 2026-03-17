@@ -1,6 +1,6 @@
 {
   "productName": "SteamHighlightExtractor",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "identifier": "com.steamhighlightextractor.app",
   "build": {
     "frontendDist": "../dist",
@@ -21,7 +21,11 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src http://127.0.0.1:7847; img-src 'self' http://127.0.0.1:7847; style-src 'unsafe-inline' 'self'; font-src 'self' data:"
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      },
+      "csp": "default-src 'self'; connect-src http://127.0.0.1:7847; img-src 'self' http://127.0.0.1:7847 asset: blob:; media-src 'self' asset: blob:; style-src 'unsafe-inline' 'self'; font-src 'self' data:"
     }
   },
   "bundle": {

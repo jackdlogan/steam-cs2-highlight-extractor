@@ -28,6 +28,7 @@ export async function openOutput(outputFolder) {
   })
 }
 
+
 /**
  * POST to a streaming SSE endpoint.
  * Calls onEvent(event) for each SSE message.

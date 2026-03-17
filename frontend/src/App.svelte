@@ -1,6 +1,9 @@
 <script>
   import { onMount } from 'svelte'
   import { open as openDialog } from '@tauri-apps/plugin-dialog'
+  import { convertFileSrc } from '@tauri-apps/api/core'
+  import { tick } from 'svelte'
+  import * as dashjs from 'dashjs'
   import { getStatus, getDefaults, getSessions, stopExport, openOutput, streamPost } from './lib/api.js'
   import killIconRaw  from './assets/kill-icon.svg?raw'
   import deathIconRaw from './assets/death-icon.svg?raw'
@@ -79,6 +82,19 @@
   let clipCards       = []  // [{name, tag, duration, thumbnail_url, status, size_mb, elapsed}]
   let showLog         = false
 
+  // ── Video player ─────────────────────────────────────────────────
+  let exportedPaths = new Set()  // out_path strings successfully exported
+  let playerCard    = null       // card/group currently open in the player
+  let playerSrc     = ''         // asset:// URL (mp4 mode) or manifest URL (dash mode)
+  let playerMode    = 'mp4'      // 'mp4' | 'dash'
+  let videoEl       = null
+  let dashPlayer    = null
+  let playerError   = ''
+  let playerTrimLeft  = 0        // seconds to extend/trim before clip_start (+extend, -trim)
+  let playerTrimRight = 0        // seconds to extend/trim after clip_end (+extend, -trim)
+  let dashCurrentTime = 0        // absolute session currentTime for DASH
+  let dashPaused      = true
+
   // ── Derived ────────────────────────────────────────────────────────
   // allMaps: array of { code, display } — code used for filtering, display shown in UI
   $: allMaps = [...new Map(
@@ -97,6 +113,12 @@
   $: currentClipNum    = exportTotal > 0 ? Math.min(Math.ceil(progress * exportTotal), exportTotal) : 0
   $: scanConfig        = { padBefore, padAfter, preShift, extractKills, extractDeaths }
   $: settingsDirty     = lastApplied !== null && JSON.stringify(scanConfig) !== JSON.stringify(lastApplied)
+
+  // ── Player derived ─────────────────────────────────────────────
+  $: pEffStart   = playerCard ? playerCard.clip_start    - playerTrimLeft  : 0
+  $: pEffDur     = playerCard ? Math.max(0.5, playerCard.clip_duration + playerTrimLeft + playerTrimRight) : 1
+  $: dashClipPct = pEffDur > 0 ? Math.max(0, Math.min(100, (dashCurrentTime - pEffStart) / pEffDur * 100)) : 0
+  $: dashClipTime = Math.max(0, dashCurrentTime - pEffStart)
 
   function config() {
     return {
@@ -310,6 +332,9 @@
       tag:           g.tag,
       duration:      g.clip_duration,
       thumbnail_url: g.thumbnail_url || null,
+      out_path:      g.out_path,
+      events:        g.events      || [],
+      clip_start:    g.clip_start  || 0,
       status:        'pending',
       size_mb:       0,
       elapsed:       0,
@@ -333,11 +358,13 @@
         )
         currentClipName = event.name
       } else if (event.type === 'clip_done') {
-        clipCards = clipCards.map((c, i) =>
-          i === event.index - 1
-            ? { ...c, status: event.status, size_mb: event.size_mb, elapsed: event.elapsed }
-            : c
-        )
+        clipCards = clipCards.map((c, i) => {
+          if (i !== event.index - 1) return c
+          if ((event.status === 'ok' || event.status === 'skipped') && c.out_path) {
+            exportedPaths = new Set([...exportedPaths, c.out_path])
+          }
+          return { ...c, status: event.status, size_mb: event.size_mb, elapsed: event.elapsed }
+        })
         if (event.status === 'failed') showLog = true
       } else if (event.type === 'progress') {
         progress = event.value
@@ -446,6 +473,147 @@
     const m = Math.floor(secs / 60)
     const s = Math.round(secs % 60)
     return m > 0 ? `${m}m ${s}s` : `${s}s`
+  }
+
+  // ── Video player helpers ────────────────────────────────────────
+
+  // Open exported MP4 via Tauri asset protocol (post-export)
+  function openPlayer(card) {
+    playerMode      = 'mp4'
+    playerCard      = card
+    playerSrc       = convertFileSrc(card.out_path)
+    playerTrimLeft  = 0
+    playerTrimRight = 0
+    playerError     = ''
+  }
+
+  // Open raw DASH stream for in-place preview (pre-export, kill feed)
+  async function openDashPreview(group) {
+    playerMode      = 'dash'
+    playerError     = ''
+    playerCard      = group
+    playerTrimLeft  = 0
+    playerTrimRight = 0
+    dashCurrentTime = 0
+    dashPaused      = true
+
+    const mpdUrl = `http://127.0.0.1:7847/api/session-stream/${encodeURIComponent(group.session_name)}/session.mpd?recording_path=${encodeURIComponent(recordingPath)}`
+    playerSrc = mpdUrl
+
+    // Pre-validate: verify the MPD endpoint responds before handing to dash.js
+    try {
+      const r = await fetch(mpdUrl)
+      if (!r.ok) {
+        playerError = `MPD not found (${r.status}): ${mpdUrl}`
+        return
+      }
+    } catch (err) {
+      playerError = `Cannot reach server: ${err.message}`
+      return
+    }
+
+    await tick()  // wait for videoEl to mount
+    _initDashPlayer(group.clip_start ?? 0)
+  }
+
+  function _initDashPlayer(seekTo) {
+    if (dashPlayer) { dashPlayer.destroy(); dashPlayer = null }
+    dashPlayer = dashjs.MediaPlayer().create()
+    dashPlayer.updateSettings({ streaming: { buffer: { fastSwitchEnabled: true } } })
+    // autoplay=true — don't depend on STREAM_INITIALIZED to trigger play()
+    dashPlayer.initialize(videoEl, playerSrc, true)
+
+    // Seek to clip start once the stream timeline is known
+    dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+      if (seekTo > 0) dashPlayer.seek(seekTo)
+    })
+
+    // Surface playback errors in the modal
+    dashPlayer.on(dashjs.MediaPlayer.events.ERROR, (e) => {
+      const msg = e?.error?.message || e?.event?.message
+                  || (e?.error ? JSON.stringify(e.error) : null)
+                  || 'Playback error'
+      console.error('dash.js error:', e)
+      playerError = msg
+    })
+  }
+
+  function closePlayer() {
+    if (dashPlayer) { dashPlayer.destroy(); dashPlayer = null }
+    if (videoEl) videoEl.pause()
+    playerCard      = null
+    playerSrc       = ''
+    playerError     = ''
+    playerTrimLeft  = 0
+    playerTrimRight = 0
+    dashCurrentTime = 0
+    dashPaused      = true
+  }
+
+  function onDashTimeUpdate() {
+    if (!videoEl) return
+    dashCurrentTime = videoEl.currentTime
+    // Auto-pause when clip window ends
+    if (dashCurrentTime >= pEffStart + pEffDur + 0.1) {
+      videoEl.pause()
+    }
+  }
+
+  function toggleDashPlay() {
+    if (!videoEl) return
+    if (videoEl.paused) videoEl.play().catch(() => {})
+    else videoEl.pause()
+  }
+
+  function onDashProgressClick(e) {
+    if (!videoEl || !playerCard) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const pct  = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+    const seekTo = pEffStart + pct * pEffDur
+    if (dashPlayer) dashPlayer.seek(Math.max(0, seekTo))
+    else videoEl.currentTime = Math.max(0, seekTo)
+  }
+
+  function onTrimChange() {
+    if (!playerCard) return
+    const newStart = playerCard.clip_start - playerTrimLeft
+    if (dashPlayer) dashPlayer.seek(Math.max(0, newStart))
+    else if (videoEl) videoEl.currentTime = Math.max(0, playerTrimLeft)
+  }
+
+  function applyTrim() {
+    if (!playerCard) return
+    const newStart    = playerCard.clip_start    - playerTrimLeft
+    const newDuration = playerCard.clip_duration + playerTrimLeft + playerTrimRight
+    const outName     = playerCard.out_name
+
+    // Update in live groups array
+    groups = groups.map(g =>
+      g.out_name === outName
+        ? { ...g, clip_start: newStart, clip_duration: newDuration, _trimmed: true }
+        : g
+    )
+    // Update in cache so re-scans don't revert the change
+    for (const key of Object.keys(groupCache)) {
+      groupCache[key] = groupCache[key].map(g =>
+        g.out_name === outName
+          ? { ...g, clip_start: newStart, clip_duration: newDuration, _trimmed: true }
+          : g
+      )
+    }
+
+    closePlayer()
+  }
+
+  function seekToMarker(evt) {
+    if (!playerCard) return
+    if (dashPlayer) {
+      // DASH: seek to absolute session time
+      dashPlayer.seek(Math.max(0, evt.time_sec))
+    } else if (videoEl) {
+      // MP4: seek relative to clip start
+      videoEl.currentTime = Math.max(0, evt.time_sec - playerCard.clip_start)
+    }
   }
 </script>
 
@@ -724,9 +892,15 @@
               <div class="feed-info">
                 <div class="feed-name">{feedTitle(group)}</div>
                 <div class="feed-meta">
-                  {#if group.map_name}<span class="feed-map">{#if mapIcons[group.map_name]}<img src={mapIcons[group.map_name]} alt="" class="feed-map-icon" />{/if}{group.map_display || group.map_name}</span> · {/if}{group.ts_label} · {fmtDuration(group.clip_duration)}
+                  {#if group.map_name}<span class="feed-map">{#if mapIcons[group.map_name]}<img src={mapIcons[group.map_name]} alt="" class="feed-map-icon" />{/if}{group.map_display || group.map_name}</span> · {/if}{group.ts_label} · {fmtDuration(group.clip_duration)}{#if group._trimmed}<span class="trimmed-badge">trimmed</span>{/if}
                 </div>
               </div>
+              <button class="feed-preview-btn" on:click|stopPropagation={() => openDashPreview(group)} title="Preview clip">
+                <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
+                  <circle cx="13" cy="13" r="12" fill="rgba(79,158,255,0.10)" stroke="rgba(79,158,255,0.3)" stroke-width="1.2"/>
+                  <path d="M10.5 9L18 13L10.5 17V9Z" fill="#4f9eff"/>
+                </svg>
+              </button>
             </div>
           {/each}
         </div>
@@ -791,6 +965,14 @@
                   {#if card.size_mb > 0}<span>{card.size_mb} MB</span>{/if}
                   <span class="card-elapsed">{card.elapsed}s</span>
                 </div>
+                {#if exportedPaths.has(card.out_path)}
+                  <button class="card-play-btn" on:click|stopPropagation={() => openPlayer(card)} title="Preview clip">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                      <circle cx="7" cy="7" r="6" fill="rgba(79,158,255,0.15)" stroke="rgba(79,158,255,0.4)" stroke-width="1"/>
+                      <path d="M5.5 4.5L10 7L5.5 9.5Z" fill="#4f9eff"/>
+                    </svg>
+                  </button>
+                {/if}
               {:else if card.status === 'active'}
                 <span class="card-encoding">encoding…</span>
               {/if}
@@ -819,6 +1001,138 @@
 
   </main>
 </div>
+
+<!-- ── Video player modal ─────────────────────────────────────── -->
+{#if playerCard}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+  <div class="player-backdrop" on:click={closePlayer} role="dialog" aria-modal="true">
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+    <div class="player-modal" on:click|stopPropagation role="document">
+      <div class="player-header">
+        <div class="player-header-left">
+          <span class="player-mode-badge" class:badge-preview={playerMode==='dash'} class:badge-exported={playerMode==='mp4'}>
+            {playerMode === 'dash' ? 'LIVE PREVIEW' : 'EXPORTED'}
+          </span>
+          <span class="player-title">{playerCard.out_name || playerCard.name || ''}</span>
+        </div>
+        <button class="player-close" on:click={closePlayer} aria-label="Close player">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M2 2L12 12M12 2L2 12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+      {#if playerError}
+        <div class="player-error">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style="flex-shrink:0">
+            <circle cx="7" cy="7" r="6" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M7 4v3.5M7 9.5v.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+          {playerError}
+        </div>
+      {/if}
+      <!-- svelte-ignore a11y-media-has-caption -->
+      {#if playerMode === 'mp4'}
+        <video
+          bind:this={videoEl}
+          class="player-video"
+          src={playerSrc}
+          controls
+          autoplay
+          preload="metadata"
+        ></video>
+      {:else}
+        <!-- dash.js attaches to this — no native controls, we render our own -->
+        <!-- svelte-ignore a11y-media-has-caption -->
+        <video
+          bind:this={videoEl}
+          class="player-video"
+          on:timeupdate={onDashTimeUpdate}
+          on:play={() => { dashPaused = false }}
+          on:pause={() => { dashPaused = true }}
+        ></video>
+      {/if}
+
+      <!-- MP4: static marker bar (native controls handle seek) -->
+      {#if playerMode === 'mp4' && (playerCard.events?.length > 0) && pEffDur > 0}
+        <div class="player-timeline">
+          <div class="player-track"></div>
+          {#each playerCard.events as evt}
+            {@const pct = Math.max(3, Math.min(97, (evt.time_sec - pEffStart) / pEffDur * 100))}
+            <button class="player-marker" style="left:{pct}%"
+              title="{evt.label} ({fmtDuration(Math.max(0, evt.time_sec - pEffStart))})"
+              on:click={() => seekToMarker(evt)}>
+              <svg width="10" height="10" viewBox="0 0 10 10"><path d="M5 1L9 9H1Z" fill="currentColor"/></svg>
+            </button>
+          {/each}
+        </div>
+      {/if}
+
+      <!-- DASH: custom controls scoped to clip window -->
+      {#if playerMode === 'dash'}
+        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+        <div class="dash-controls">
+          <button class="dash-play-btn" on:click={toggleDashPlay}>
+            {#if dashPaused}
+              <svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 3l10 5-10 5V3z" fill="currentColor"/></svg>
+            {:else}
+              <svg width="16" height="16" viewBox="0 0 16 16"><rect x="3" y="2" width="4" height="12" rx="1" fill="currentColor"/><rect x="9" y="2" width="4" height="12" rx="1" fill="currentColor"/></svg>
+            {/if}
+          </button>
+
+          <!-- Progress bar — represents clip window only -->
+          <!-- svelte-ignore a11y-click-events-have-key-events -->
+          <div class="dash-progress" on:click={onDashProgressClick}>
+            <div class="dash-progress-bg"></div>
+            <div class="dash-progress-fill" style="width:{dashClipPct}%"></div>
+            <div class="dash-playhead" style="left:{dashClipPct}%"></div>
+            <!-- Event markers as ticks on the bar -->
+            {#each playerCard.events ?? [] as evt}
+              {@const tPct = Math.max(0, Math.min(100, (evt.time_sec - pEffStart) / pEffDur * 100))}
+              <button class="dash-tick" style="left:{tPct}%"
+                title="{evt.label} ({fmtDuration(Math.max(0, evt.time_sec - pEffStart))})"
+                on:click|stopPropagation={() => seekToMarker(evt)}></button>
+            {/each}
+          </div>
+
+          <span class="dash-time">{fmtDuration(dashClipTime)} / {fmtDuration(pEffDur)}</span>
+        </div>
+
+        <!-- Trim controls -->
+        <div class="player-trim">
+          <div class="trim-section-label">
+            <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+              <path d="M1 3.5h9M1 7.5h9M3.5 1L2 5.5l1.5 4.5M7.5 1L9 5.5 7.5 10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+            </svg>
+            TRIM CLIP
+          </div>
+          <div class="trim-row">
+            <span class="trim-label">Start</span>
+            <input class="trim-slider" type="range" min="-5" max="20" step="0.5"
+              bind:value={playerTrimLeft} on:input={onTrimChange} />
+            <span class="trim-val" class:trim-pos={playerTrimLeft>0} class:trim-neg={playerTrimLeft<0}>
+              {playerTrimLeft > 0 ? '+' : ''}{playerTrimLeft}s
+            </span>
+          </div>
+          <div class="trim-row">
+            <span class="trim-label">End</span>
+            <input class="trim-slider" type="range" min="-5" max="20" step="0.5"
+              bind:value={playerTrimRight} on:input={onTrimChange} />
+            <span class="trim-val" class:trim-pos={playerTrimRight>0} class:trim-neg={playerTrimRight<0}>
+              {playerTrimRight > 0 ? '+' : ''}{playerTrimRight}s
+            </span>
+          </div>
+          <div class="trim-footer">
+            <span class="trim-duration">{fmtDuration(pEffDur)}</span>
+            <button class="btn-primary trim-export-btn" on:click={applyTrim}
+              disabled={playerTrimLeft === 0 && playerTrimRight === 0}>
+              ✓ Apply
+            </button>
+          </div>
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
 
 <!-- ── Action bar ─────────────────────────────────────────────────── -->
 <footer>
@@ -1730,4 +2044,405 @@ footer {
   cursor: pointer;
 }
 .micro:hover { background: var(--border); color: var(--text); }
+
+/* ── Kill feed preview button ───────────────────────────────── */
+.feed-preview-btn {
+  background: none;
+  border: none;
+  padding: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+.feed-row:hover .feed-preview-btn { opacity: 1; }
+
+/* ── Card play button ────────────────────────────────────────── */
+.card-play-btn {
+  background: none;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+  display: flex;
+  align-items: center;
+  margin-top: 3px;
+}
+.card-play-btn:hover { opacity: 1; }
+
+/* ── Video player modal ──────────────────────────────────────── */
+/* ── Video player modal ──────────────────────────────────────── */
+@keyframes player-in {
+  from { opacity: 0; transform: scale(0.97) translateY(10px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.player-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.88);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.player-modal {
+  background: #0d1117;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  width: min(920px, 92vw);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 32px 96px rgba(0,0,0,0.8), 0 0 0 1px rgba(255,255,255,0.04);
+  animation: player-in 0.18s ease;
+}
+
+/* Header */
+.player-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  flex-shrink: 0;
+  gap: 10px;
+}
+
+.player-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.player-mode-badge {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  padding: 2px 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  text-transform: uppercase;
+}
+.badge-preview {
+  background: rgba(79,158,255,0.15);
+  color: var(--blue);
+  border: 1px solid rgba(79,158,255,0.25);
+}
+.badge-exported {
+  background: rgba(0,229,160,0.12);
+  color: var(--green);
+  border: 1px solid rgba(0,229,160,0.2);
+}
+
+.player-title {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: rgba(255,255,255,0.45);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-close {
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 6px;
+  color: rgba(255,255,255,0.45);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.player-close:hover {
+  background: rgba(255,80,80,0.15);
+  border-color: rgba(255,80,80,0.3);
+  color: #ff6b6b;
+}
+
+/* Error banner */
+.player-error {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: rgba(255,107,107,0.1);
+  border-bottom: 1px solid rgba(255,107,107,0.2);
+  color: #ff6b6b;
+  font-size: 11px;
+  padding: 8px 14px;
+  flex-shrink: 0;
+}
+
+/* Video */
+.player-video {
+  width: 100%;
+  display: block;
+  background: #000;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+}
+
+/* MP4 static marker bar */
+.player-timeline {
+  position: relative;
+  height: 36px;
+  background: rgba(0,0,0,0.35);
+  border-top: 1px solid rgba(255,255,255,0.06);
+  flex-shrink: 0;
+}
+.player-track {
+  position: absolute;
+  top: 50%; left: 14px; right: 14px;
+  height: 2px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 1px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.player-marker {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 4px;
+  background: rgba(79,158,255,0.12);
+  border: 1px solid rgba(79,158,255,0.35);
+  color: var(--blue);
+  cursor: pointer; padding: 0;
+  transition: background 0.15s, color 0.15s, transform 0.15s, box-shadow 0.15s;
+}
+.player-marker:hover {
+  background: var(--blue); color: #fff;
+  transform: translate(-50%, -50%) scale(1.15);
+  box-shadow: 0 0 10px rgba(79,158,255,0.5);
+}
+
+/* DASH custom controls */
+.dash-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: rgba(0,0,0,0.3);
+  border-top: 1px solid rgba(255,255,255,0.06);
+  flex-shrink: 0;
+}
+
+.dash-play-btn {
+  width: 38px; height: 38px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(79,158,255,0.15);
+  border: 1px solid rgba(79,158,255,0.35);
+  border-radius: 50%;
+  color: var(--blue);
+  cursor: pointer; padding: 0; flex-shrink: 0;
+  transition: background 0.15s, box-shadow 0.15s, transform 0.12s;
+}
+.dash-play-btn:hover {
+  background: var(--blue);
+  color: #fff;
+  box-shadow: 0 0 16px rgba(79,158,255,0.45);
+  transform: scale(1.06);
+}
+.dash-play-btn:active { transform: scale(0.96); }
+
+/* Seekable progress track — clip window only */
+.dash-progress {
+  flex: 1;
+  position: relative;
+  height: 32px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+.dash-progress-bg {
+  position: absolute;
+  left: 0; right: 0; top: 50%;
+  height: 4px;
+  transform: translateY(-50%);
+  background: rgba(255,255,255,0.1);
+  border-radius: 2px;
+  pointer-events: none;
+  transition: height 0.15s;
+}
+.dash-progress-fill {
+  position: absolute;
+  left: 0; top: 50%;
+  height: 4px;
+  transform: translateY(-50%);
+  background: linear-gradient(to right, #3577d4, var(--blue));
+  border-radius: 2px;
+  pointer-events: none;
+  transition: height 0.15s;
+}
+.dash-progress:hover .dash-progress-bg,
+.dash-progress:hover .dash-progress-fill { height: 6px; }
+
+.dash-playhead {
+  position: absolute;
+  top: 50%;
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 2px var(--blue), 0 2px 8px rgba(0,0,0,0.5);
+  transform: translate(-50%, -50%) scale(0.6);
+  opacity: 0;
+  pointer-events: none;
+  transition: left 0.08s linear, opacity 0.15s, transform 0.15s;
+}
+.dash-progress:hover .dash-playhead {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+/* Kill event tick marks */
+.dash-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px; height: 14px;
+  transform: translate(-50%, -50%);
+  background: var(--yellow);
+  border-radius: 1px;
+  border: none; padding: 0;
+  cursor: pointer;
+  opacity: 0.65;
+  transition: opacity 0.12s, background 0.12s, height 0.12s, box-shadow 0.12s;
+}
+.dash-tick:hover {
+  opacity: 1;
+  height: 18px;
+  background: var(--green);
+  box-shadow: 0 0 8px rgba(0,229,160,0.5);
+}
+
+.dash-time {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: rgba(255,255,255,0.5);
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-width: 72px;
+  text-align: right;
+}
+
+/* Trim controls */
+.player-trim {
+  background: rgba(0,0,0,0.2);
+  border-top: 1px solid rgba(255,255,255,0.06);
+  padding: 10px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex-shrink: 0;
+}
+
+.trim-section-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.25);
+  margin-bottom: 2px;
+}
+
+.trim-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.trim-label {
+  font-size: 10px;
+  color: rgba(255,255,255,0.35);
+  width: 36px;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+}
+
+/* Custom range slider */
+.trim-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255,255,255,0.1);
+  cursor: pointer;
+  outline: none;
+}
+.trim-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--blue);
+  border: 2px solid #0d1117;
+  box-shadow: 0 0 0 1px var(--blue);
+  cursor: pointer;
+  transition: transform 0.12s, box-shadow 0.12s;
+}
+.trim-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+  box-shadow: 0 0 8px rgba(79,158,255,0.5);
+}
+.trim-slider::-moz-range-thumb {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--blue);
+  border: 2px solid #0d1117;
+  cursor: pointer;
+}
+
+.trim-val {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: rgba(255,255,255,0.35);
+  width: 42px;
+  text-align: right;
+  flex-shrink: 0;
+  transition: color 0.12s;
+}
+.trim-val.trim-pos { color: var(--green); }
+.trim-val.trim-neg { color: var(--red); }
+
+.trim-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 4px;
+}
+.trim-duration {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: rgba(255,255,255,0.6);
+  font-weight: 500;
+}
+.trim-export-btn {
+  font-size: 11px;
+  padding: 5px 14px;
+  border-radius: 6px;
+}
+
+.trimmed-badge {
+  margin-left: 5px;
+  padding: 1px 5px;
+  font-size: 9px;
+  border-radius: 3px;
+  background: rgba(240,192,64,0.12);
+  color: var(--yellow);
+  border: 1px solid rgba(240,192,64,0.25);
+  vertical-align: middle;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
 </style>
