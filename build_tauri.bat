@@ -38,6 +38,14 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
+REM ── Check for bundled ffmpeg ──────────────────────────────────────
+if not exist "ffmpeg.exe" (
+    echo ERROR: ffmpeg.exe not found in project root.
+    echo   Download from: https://www.gyan.dev/ffmpeg/builds/
+    echo   Extract ffmpeg.exe and place it here: %CD%\ffmpeg.exe
+    pause & exit /b 1
+)
+
 REM ── Step 1: Build Python server ───────────────────────────────────
 echo [1/4] Building Python server sidecar...
 echo -----------------------------------------------

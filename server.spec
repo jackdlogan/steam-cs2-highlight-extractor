@@ -6,7 +6,7 @@ block_cipher = None
 a = Analysis(
     ['server.py'],
     pathex=['.'],
-    binaries=[],
+    binaries=[('ffmpeg.exe', '.')],
     datas=[],
     hiddenimports=[
         'uvicorn.logging',
