@@ -8,7 +8,7 @@ It reads the timeline data Steam already records alongside your gameplay, finds 
 
 ## Quick Start
 
-1. **Download** `SteamHighlightExtractor_2.2.0_x64-setup.exe` from the [Releases](../../releases) page and install it
+1. **Download** `SteamHighlightExtractor_2.3.0_x64-setup.exe` from the [Releases](../../releases) page and install it
 2. **Enable Steam Background Recording**
    Steam → Settings → Game Recording → turn on Background Recording
 3. **Launch** `Steam Highlight Extractor` from the Start Menu
@@ -33,8 +33,9 @@ The app auto-detects your Steam recording folder on launch and scans the most re
 4. **Trim clips** inside the preview player — use the Start/End sliders to adjust clip boundaries, then click **✓ Apply** to save; trimmed rows get a **TRIMMED** badge
 5. **Check the clips** you want to export (all are selected by default)
 6. Set your **output folder** and toggle **Merge** if you want a single combined file
-7. Click **▶ Export Selected** — per-clip progress cards show encoding status in real time
-8. Click **📂 Open Output Folder** when done
+7. Pick a **Quality** — Low (smaller files), Medium (default), or High (best quality)
+8. Click **Extract Highlights** — per-clip progress cards show encoding status in real time; a merge progress bar appears if merging
+9. Click **Open Folder** when done
 
 Use **⏹ Stop** to cancel at any time. Already-exported clips are always skipped automatically, so re-running is safe.
 
@@ -51,6 +52,7 @@ Use **⏹ Stop** to cancel at any time. Already-exported clips are always skippe
 | Kills | ✅ | Extract kill events |
 | Deaths | ☐ | Extract death events |
 | Merge into one file | ☐ | Concatenate all exported clips into a single MP4 |
+| Quality | Medium | Export quality — Low (CRF 28), Medium (CRF 23), High (CRF 18) |
 
 ---
 

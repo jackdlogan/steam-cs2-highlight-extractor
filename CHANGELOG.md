@@ -2,6 +2,19 @@
 
 All notable changes to Steam Highlight Extractor are documented here.
 
+## [2.3.0] - 2026-03-17
+
+### Added
+- **Quality selection** — Low / Medium / High dropdown next to Extract Highlights; maps to CRF 28 / 23 / 18 across all encoders (NVENC, AMF, QSV, libx264)
+- **Merge progress bar** — progress bar resets and pulses yellow while ffmpeg merges clips, with "Merging N clips…" label in the footer
+
+### Fixed
+- **Death badge icon** — death clips now correctly show the red skull badge instead of a green star (was caused by `_is_kill_event` matching "killed" as a substring of "you were killed by")
+- **Map icons in built app** — CSP was missing `data:` from `img-src`; Vite inlines small PNGs as base64 data URIs which were blocked in production
+
+### Changed
+- Footer rearranged: Re-scan + Open Folder on the left; Merge toggle, Quality, and Extract Highlights on the right
+
 ## [2.2.0] - 2026-03-17
 
 ### Added

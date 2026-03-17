@@ -495,7 +495,10 @@ def parse_mpd_info(mpd_path):
         return 643, 3.0, 0.0, 0.0
 
 
-def export_clip(session_dir, start_sec, duration, output_path):
+QUALITY_CRF = {"high": 18, "medium": 23, "low": 28}
+
+
+def export_clip(session_dir, start_sec, duration, output_path, quality="medium"):
     """Export a clip by directly concatenating the relevant .m4s chunk files."""
     start_sec = max(0.0, start_sec)
     mpd_path = session_dir / "session.mpd"
@@ -554,17 +557,18 @@ def export_clip(session_dir, start_sec, duration, output_path):
         # has an audio stream (required for seamless concat filter during merge).
         cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000"]
         cmd += ["-vf", vf, "-af", f"atrim=duration={duration:.6f},asetpts=PTS-STARTPTS"]
+    qv = str(QUALITY_CRF.get(quality, 23))
     if GPU_ENCODER == "h264_nvenc":
         cmd += ["-c:v", "h264_nvenc", "-preset", "p4",
-                "-rc:v", "vbr", "-cq:v", "23"]
+                "-rc:v", "vbr", "-cq:v", qv]
     elif GPU_ENCODER == "h264_amf":
         cmd += ["-c:v", "h264_amf", "-quality", "speed",
-                "-qp_i", "23", "-qp_p", "23", "-qp_b", "23"]
+                "-qp_i", qv, "-qp_p", qv, "-qp_b", qv]
     elif GPU_ENCODER == "h264_qsv":
         cmd += ["-c:v", "h264_qsv", "-preset", "faster",
-                "-global_quality", "23"]
+                "-global_quality", qv]
     else:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", qv]
     cmd += ["-c:a", "aac", "-shortest", "-movflags", "+faststart"]
     cmd += [str(output_path)]
 
@@ -658,8 +662,11 @@ def _parse_datetime_from_name(name):
 
 
 def _is_kill_event(event):
-    label = (event.get("type", "") + " " + event.get("label", "")).lower()
-    return any(kw in label for kw in KILL_EVENTS)
+    title = event.get("label", "").lower()
+    icon  = event.get("type",  "").lower()
+    # Use "you killed" (not "kill") to avoid matching "you were killed" (death events).
+    # Check icon separately so "cs2_kill" still matches without false-positives on "cs2_death".
+    return "you killed" in title or any(kw in icon for kw in KILL_EVENTS)
 
 
 def _is_self_kill(event):
@@ -887,7 +894,7 @@ def scan_session_groups(session_dir, output_folder):
     return enriched
 
 
-def merge_clips(clip_paths, output_path):
+def merge_clips(clip_paths, output_path, quality="medium"):
     """
     Concatenate a list of MP4 files into one seamless output file.
     Uses the ffmpeg concat filter (frame-accurate, no PTS drift between clips)
@@ -923,7 +930,8 @@ def merge_clips(clip_paths, output_path):
         # Always use libx264 for merge — GPU encoders (QSV/NVENC/AMF) require
         # hardware surface input and can't directly consume a software concat
         # filter graph, causing "Invalid argument" errors on some drivers.
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+        qv = str(QUALITY_CRF.get(quality, 23))
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", qv]
         cmd += ["-c:a", "aac", "-movflags", "+faststart", str(output_path)]
 
         result = subprocess.run(cmd, capture_output=True, timeout=600,
@@ -963,7 +971,7 @@ def _group_events_into_segments(events, threshold):
     return segments
 
 
-def export_single_group(group, stop_event=None, force=False):
+def export_single_group(group, stop_event=None, force=False, quality="medium"):
     """
     Export one enriched group dict produced by scan_session_groups.
 
@@ -1001,6 +1009,7 @@ def export_single_group(group, stop_event=None, force=False):
             group["clip_start"],
             group["clip_duration"],
             out_path,
+            quality=quality,
         ) else False
 
     # Multiple segments — export each to a temp file then merge
@@ -1014,12 +1023,12 @@ def export_single_group(group, stop_event=None, force=False):
             seg_start = max(0.0, seg[0]["time_sec"] - CLIP_PADDING_BEFORE - pre_shift)
             seg_end   = seg[-1]["time_sec"] + CLIP_PADDING_AFTER + pre_shift
             tmp_path  = tmp_dir / f"seg_{i:03d}.mp4"
-            if not export_clip(group["session_dir"], seg_start, seg_end - seg_start, tmp_path):
+            if not export_clip(group["session_dir"], seg_start, seg_end - seg_start, tmp_path, quality=quality):
                 return False
             tmp_clips.append(tmp_path)
 
         print(f"    Jump-cutting {len(tmp_clips)} segments together…")
-        return merge_clips(tmp_clips, out_path)
+        return merge_clips(tmp_clips, out_path, quality=quality)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

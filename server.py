@@ -63,10 +63,11 @@ class ScanRequest(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    groups:  list[dict]      # serialised group dicts (out_path/session_dir as strings)
-    config:  Config
-    merge:   bool = False
-    workers: int  = 1
+    groups:   list[dict]      # serialised group dicts (out_path/session_dir as strings)
+    config:   Config
+    merge:    bool = False
+    workers:  int  = 1
+    quality:  str  = "medium"  # "high" | "medium" | "low"
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
@@ -296,7 +297,7 @@ def export_groups(req: ExportRequest):
                        "tag": group.get("tag", ""), "duration": group.get("clip_duration", 0)})
                 t0 = time.time()
                 try:
-                    result = core.export_single_group(group, stop_event=_stop_event, force=do_merge)
+                    result = core.export_single_group(group, stop_event=_stop_event, force=do_merge, quality=req.quality)
                 except Exception as exc:
                     return i, group, safe_name, False, round(time.time() - t0, 1), str(exc)
                 return i, group, safe_name, result, round(time.time() - t0, 1), None
@@ -361,10 +362,11 @@ def export_groups(req: ExportRequest):
                 from datetime import datetime
                 merged_name = f"highlights_merged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
                 merged_path = output_dir / merged_name
+                q.put({"type": "merging", "count": len(exported_paths)})
                 q.put({"type": "log",
                        "text":  f"\n  Merging {len(exported_paths)} clips into {merged_name}…\n",
                        "level": "info"})
-                ok = core.merge_clips(exported_paths, merged_path)
+                ok = core.merge_clips(exported_paths, merged_path, quality=req.quality)
                 if ok and merged_path.exists():
                     size_mb = merged_path.stat().st_size / 1_000_000
                     q.put({"type": "log",

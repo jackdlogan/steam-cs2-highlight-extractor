@@ -59,6 +59,7 @@
   let extractDeaths = false
   let doMerge       = false
   let workers       = 1
+  let quality       = 'medium'
   let lastApplied   = null   // config snapshot from last scan
 
   // ── Sessions ───────────────────────────────────────────────────────
@@ -79,6 +80,8 @@
   let stopped        = false
   let exportTotal     = 0
   let currentClipName = ''
+  let merging        = false
+  let mergingCount   = 0
   let clipCards       = []  // [{name, tag, duration, thumbnail_url, status, size_mb, elapsed}]
   let showLog         = false
 
@@ -327,6 +330,8 @@
     showLog         = false
     exportTotal     = selectedCount
     currentClipName = ''
+    merging         = false
+    mergingCount    = 0
     clipCards       = selectedGroupList.map(g => ({
       name:          g.out_name,
       tag:           g.tag,
@@ -345,6 +350,7 @@
       config:   config(),
       merge:    doMerge,
       workers:  workers,
+      quality:  quality,
     }, (event) => {
       if (event.type === 'log') {
         logs = [...logs, { text: event.text, level: event.level }]
@@ -366,13 +372,19 @@
           return { ...c, status: event.status, size_mb: event.size_mb, elapsed: event.elapsed }
         })
         if (event.status === 'failed') showLog = true
+      } else if (event.type === 'merging') {
+        merging      = true
+        mergingCount = event.count
+        progress     = 0
       } else if (event.type === 'progress') {
         progress = event.value
       } else if (event.type === 'done') {
+        merging  = false
         stopped  = event.stopped
         phase    = 'done'
         progress = 1
       } else if (event.type === 'error') {
+        merging  = false
         logs     = [...logs, { text: 'Error: ' + event.message, level: 'err' }]
         showLog  = true
         phase    = 'done'
@@ -1015,11 +1027,7 @@
           </span>
           <span class="player-title">{playerCard.out_name || playerCard.name || ''}</span>
         </div>
-        <button class="player-close" on:click={closePlayer} aria-label="Close player">
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <path d="M2 2L12 12M12 2L2 12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-          </svg>
-        </button>
+        <button class="player-close" on:click={closePlayer} aria-label="Close player">✕</button>
       </div>
       {#if playerError}
         <div class="player-error">
@@ -1142,7 +1150,8 @@
       <div
         class="progress-fill"
         class:progress-done={phase === 'done'}
-        style="width:{progress * 100}%"
+        class:progress-merging={merging}
+        style="width:{merging ? 100 : progress * 100}%"
       ></div>
     </div>
   {/if}
@@ -1153,15 +1162,6 @@
         <button class="btn-ghost" on:click={onScan} disabled={busy || selectedSessions.size === 0}>
           ↻ Re-scan
         </button>
-      {/if}
-      {#if phase === 'results'}
-        <label class="merge-check">
-          <input type="checkbox" bind:checked={doMerge} />
-          Merge into one clip
-        </label>
-        {#if selectedCount > 0}
-          <span class="count-pill">{selectedCount} selected</span>
-        {/if}
       {/if}
       {#if phase === 'exporting'}
         <button class="btn-danger" on:click={onStop}>
@@ -1180,12 +1180,29 @@
 
     <div class="footer-right">
       {#if phase === 'exporting'}
-        {#if currentClipName}
+        {#if merging}
+          <span class="current-clip">Merging {mergingCount} clips…</span>
+        {:else if currentClipName}
           <span class="current-clip">{currentClipName}</span>
         {/if}
-        <span class="progress-pct">{Math.round(progress * 100)}%</span>
+        <span class="progress-pct">{merging ? '…' : Math.round(progress * 100) + '%'}</span>
       {/if}
       {#if phase === 'results'}
+        <label class="merge-check">
+          <input type="checkbox" bind:checked={doMerge} />
+          Merge into one clip
+        </label>
+        {#if selectedCount > 0}
+          <span class="count-pill">{selectedCount} selected</span>
+        {/if}
+        <label class="quality-label">
+          Quality
+          <select class="quality-select" bind:value={quality} disabled={busy}>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+        </label>
         <button class="btn-primary" on:click={onExport} disabled={busy || selectedCount === 0}>
           Extract Highlights
         </button>
@@ -1873,6 +1890,14 @@ footer {
   border-radius: 2px;
 }
 .progress-done { background: var(--green); }
+.progress-merging {
+  background: var(--yellow);
+  animation: progress-pulse 1.2s ease-in-out infinite;
+}
+@keyframes progress-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.5; }
+}
 
 .footer-main {
   display: flex;
@@ -1913,6 +1938,30 @@ footer {
   white-space: nowrap;
   max-width: 300px;
 }
+
+.quality-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.quality-select {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 8px;
+  cursor: pointer;
+  outline: none;
+}
+.quality-select:focus { border-color: var(--blue); }
+.quality-select:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Merge + count pill */
 .merge-check {
@@ -2155,16 +2204,18 @@ footer {
   width: 28px; height: 28px;
   display: flex; align-items: center; justify-content: center;
   background: rgba(255,255,255,0.06);
-  border: 1px solid rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.08) !important;
   border-radius: 6px;
-  color: rgba(255,255,255,0.45);
+  color: rgba(255,255,255,0.6);
+  font-size: 16px;
+  line-height: 1;
   cursor: pointer;
   flex-shrink: 0;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 .player-close:hover {
   background: rgba(255,80,80,0.15);
-  border-color: rgba(255,80,80,0.3);
+  border-color: rgba(255,80,80,0.3) !important;
   color: #ff6b6b;
 }
 
