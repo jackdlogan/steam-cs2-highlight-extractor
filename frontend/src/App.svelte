@@ -46,7 +46,6 @@
   // ── Server / init state ────────────────────────────────────────────
   let serverOk    = false
   let ffmpegFound = false
-  let gpuEncoder  = null
   let serverError = ''
 
   // ── Config ─────────────────────────────────────────────────────────
@@ -59,7 +58,6 @@
   let extractDeaths = false
   let doMerge       = false
   let workers       = 1
-  let quality       = 'medium'
   let lastApplied   = null   // config snapshot from last scan
 
   // ── Sessions ───────────────────────────────────────────────────────
@@ -147,8 +145,6 @@
         const status = await getStatus()
         serverOk    = status.ok
         ffmpegFound = status.ffmpeg_found
-        gpuEncoder  = status.gpu_encoder || null
-        workers     = gpuEncoder ? 3 : 1
         if (serverOk) {
           await loadDefaults()
           return
@@ -350,7 +346,6 @@
       config:   config(),
       merge:    doMerge,
       workers:  workers,
-      quality:  quality,
     }, (event) => {
       if (event.type === 'log') {
         logs = [...logs, { text: event.text, level: event.level }]
@@ -651,10 +646,6 @@
       <span class="status-text">Ready</span>
       <span class="status-sep">·</span>
       <span class="ffmpeg-ok">ffmpeg ✓</span>
-      {#if gpuEncoder}
-        <span class="status-sep">·</span>
-        <span class="gpu-badge">{gpuEncoder.replace('h264_', '').toUpperCase()}</span>
-      {/if}
     {/if}
   </div>
 </header>
@@ -746,7 +737,7 @@
         </div>
       </div>
       <div class="setting-row">
-        <span class="setting-label">Export workers{gpuEncoder ? ' (GPU)' : ''}</span>
+        <span class="setting-label">Export workers</span>
         <div class="setting-control">
           <input type="range" bind:value={workers} min="1" max="4" step="1" />
           <span class="setting-val">{workers}</span>
@@ -1195,14 +1186,6 @@
         {#if selectedCount > 0}
           <span class="count-pill">{selectedCount} selected</span>
         {/if}
-        <label class="quality-label">
-          Quality
-          <select class="quality-select" bind:value={quality} disabled={busy}>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
-          </select>
-        </label>
         <button class="btn-primary" on:click={onExport} disabled={busy || selectedCount === 0}>
           Extract Highlights
         </button>
@@ -1277,16 +1260,6 @@ header {
 }
 :global(.badge-icon:first-child) { margin-left: 0; }
 
-.gpu-badge {
-  color: var(--green);
-  background: rgba(0,229,160,0.08);
-  border: 1px solid rgba(0,229,160,0.25);
-  border-radius: 3px;
-  padding: 1px 6px;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-}
 
 .dot {
   width: 7px;
@@ -1938,30 +1911,6 @@ footer {
   white-space: nowrap;
   max-width: 300px;
 }
-
-.quality-label {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  color: var(--muted);
-  cursor: pointer;
-  user-select: none;
-}
-
-.quality-select {
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  padding: 4px 8px;
-  cursor: pointer;
-  outline: none;
-}
-.quality-select:focus { border-color: var(--blue); }
-.quality-select:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Merge + count pill */
 .merge-check {

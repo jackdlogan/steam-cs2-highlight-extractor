@@ -33,9 +33,8 @@ The app auto-detects your Steam recording folder on launch and scans the most re
 4. **Trim clips** inside the preview player — use the Start/End sliders to adjust clip boundaries, then click **✓ Apply** to save; trimmed rows get a **TRIMMED** badge
 5. **Check the clips** you want to export (all are selected by default)
 6. Set your **output folder** and toggle **Merge** if you want a single combined file
-7. Pick a **Quality** — Low (smaller files), Medium (default), or High (best quality)
-8. Click **Extract Highlights** — per-clip progress cards show encoding status in real time; a merge progress bar appears if merging
-9. Click **Open Folder** when done
+7. Click **Extract Highlights** — per-clip progress cards show status in real time; a merge progress bar appears if merging
+8. Click **Open Folder** when done
 
 Use **⏹ Stop** to cancel at any time. Already-exported clips are always skipped automatically, so re-running is safe.
 
@@ -52,7 +51,6 @@ Use **⏹ Stop** to cancel at any time. Already-exported clips are always skippe
 | Kills | ✅ | Extract kill events |
 | Deaths | ☐ | Extract death events |
 | Merge into one file | ☐ | Concatenate all exported clips into a single MP4 |
-| Quality | Medium | Export quality — Low (CRF 28), Medium (CRF 23), High (CRF 18) |
 
 ---
 
@@ -117,9 +115,7 @@ This tool:
 2. Calculates which recording chunks cover each event, accounting for circular buffer rollover
 3. Extracts a thumbnail frame from the clip midpoint during the scan phase
 4. Serves the raw DASH stream to the in-app preview player so you can watch before exporting
-5. Concatenates the relevant chunks and uses ffmpeg to trim and encode each clip
-
-GPU-accelerated encoding is used automatically when available (NVIDIA NVENC, AMD AMF, or Intel Quick Sync). Falls back to software libx264 if no GPU encoder is detected.
+5. Concatenates the relevant chunks and stream-copies them into a trimmed MP4 — no re-encoding, so export is near-instant and lossless relative to the source
 
 No screen capture, no AI analysis — it uses the data Steam already collected.
 
@@ -127,7 +123,7 @@ No screen capture, no AI analysis — it uses the data Steam already collected.
 
 ## Output
 
-Clips are saved as `.mp4` files encoded in H.264/AAC, ready to share or edit. Multi-kill clips are labelled with the kill count (e.g. `_3k_`, `_ace_`).
+Clips are saved as `.mp4` files in H.264/AAC, stream-copied directly from the source recording — no quality loss, no re-encoding wait. Multi-kill clips are labelled with the kill count (e.g. `_3k_`, `_ace_`).
 
 ---
 
@@ -163,7 +159,7 @@ Currently tested with **Counter-Strike 2 (CS2)**. Any game that writes events to
 
 | File | Purpose |
 |---|---|
-| `steam_highlight_extractor.py` | Core clip logic — parse, scan, encode, merge |
+| `steam_highlight_extractor.py` | Core clip logic — parse, scan, stream-copy, merge |
 | `server.py` | FastAPI backend, serves the Tauri frontend over HTTP + SSE |
 | `frontend/` | Tauri v2 + Svelte 4 desktop app |
 | `server.spec` | PyInstaller spec for bundling the backend sidecar (includes ffmpeg) |

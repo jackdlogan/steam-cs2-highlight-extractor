@@ -120,58 +120,6 @@ def _ffmpeg_version():
         return ""
 
 
-def _detect_gpu_encoder():
-    """
-    Probe ffmpeg for available GPU H.264 encoders.
-    Result is cached to disk — probing only runs when ffmpeg version changes
-    or the cache is missing. Returns encoder name or None (→ libx264 fallback).
-    """
-    if not FFMPEG_BIN:
-        return None
-
-    ffmpeg_ver = _ffmpeg_version()
-
-    # Try reading cache
-    try:
-        cached = json.loads(_ENCODER_CACHE_PATH.read_text(encoding="utf-8"))
-        if cached.get("ffmpeg_version") == ffmpeg_ver:
-            return cached.get("encoder")  # may be None (no GPU encoder found)
-    except Exception:
-        pass  # cache missing or corrupt — probe fresh
-
-    # Probe each candidate
-    candidates = ["h264_nvenc", "h264_amf", "h264_qsv"]
-    no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    found = None
-    for enc in candidates:
-        try:
-            result = subprocess.run(
-                [FFMPEG_BIN, "-y",
-                 "-f", "lavfi", "-i", "nullsrc=s=32x32:d=0.1",
-                 "-vframes", "1", "-c:v", enc, "-f", "null", "-"],
-                capture_output=True, timeout=10, creationflags=no_window,
-            )
-            if result.returncode == 0:
-                found = enc
-                break
-        except Exception:
-            continue
-
-    # Write cache
-    try:
-        _ENCODER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _ENCODER_CACHE_PATH.write_text(
-            json.dumps({"ffmpeg_version": ffmpeg_ver, "encoder": found}),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass  # non-fatal — cache just won't persist
-
-    return found
-
-
-GPU_ENCODER = _detect_gpu_encoder()
-
 
 def check_ffmpeg():
     if FFMPEG_BIN:
@@ -495,11 +443,16 @@ def parse_mpd_info(mpd_path):
         return 643, 3.0, 0.0, 0.0
 
 
-QUALITY_CRF = {"high": 18, "medium": 23, "low": 28}
 
+def export_clip(session_dir, start_sec, duration, output_path):
+    """Export a clip using stream copy — no re-encoding, near-instant export.
 
-def export_clip(session_dir, start_sec, duration, output_path, quality="medium"):
-    """Export a clip by directly concatenating the relevant .m4s chunk files."""
+    Concatenates the relevant .m4s chunks via the concat: protocol and copies
+    the H.264/AAC streams directly (-c:v copy -c:a copy).  Output-side -ss/-t
+    trim the clip; because DASH segments start at keyframes the cut snaps to
+    the nearest keyframe (~segment boundary), which is imperceptible for
+    game highlights.
+    """
     start_sec = max(0.0, start_sec)
     mpd_path = session_dir / "session.mpd"
     start_number, seg_dur, total_dur, period_start = parse_mpd_info(mpd_path)
@@ -536,46 +489,34 @@ def export_clip(session_dir, start_sec, duration, output_path, quality="medium")
         print(f"    The event may be outside the circular buffer's retained window.")
         return False
 
+    if not FFMPEG_BIN:
+        print("    ERROR: ffmpeg is not installed. Cannot export clips.")
+        print("    Run:  winget install Gyan.FFmpeg")
+        return False
+
     v_concat = "|".join(v_files)
     a_concat = "|".join(a_files)
-
-    # Chunks carry absolute PTS (e.g. ~1926s). We reset PTS to 0 with setpts/asetpts,
-    # then use trim/atrim to cut exactly offset_in_chunk seconds from the start.
-    vf_base = f"setpts=PTS-STARTPTS,trim=start={offset_in_chunk:.6f}:duration={duration:.6f},setpts=PTS-STARTPTS"
-    af = f"asetpts=PTS-STARTPTS,atrim=start={offset_in_chunk:.6f}:duration={duration:.6f},asetpts=PTS-STARTPTS"
-
-    # h264_qsv requires NV12 input — add format conversion after software filters
-    vf = vf_base + (",format=nv12" if GPU_ENCODER == "h264_qsv" else "")
 
     cmd = [FFMPEG_BIN, "-y"]
     cmd += ["-i", f"concat:{v_concat}"]
     if len(a_files) >= 2:
         cmd += ["-i", f"concat:{a_concat}"]
-        cmd += ["-vf", vf, "-af", af]
+        cmd += ["-map", "0:v", "-map", "1:a"]
+        cmd += ["-c:v", "copy", "-c:a", "copy"]
     else:
-        # No audio chunks — inject a silent stereo track so the output always
-        # has an audio stream (required for seamless concat filter during merge).
+        # No audio chunks — encode a silent AAC track; video is still stream-copied.
         cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000"]
-        cmd += ["-vf", vf, "-af", f"atrim=duration={duration:.6f},asetpts=PTS-STARTPTS"]
-    qv = str(QUALITY_CRF.get(quality, 23))
-    if GPU_ENCODER == "h264_nvenc":
-        cmd += ["-c:v", "h264_nvenc", "-preset", "p4",
-                "-rc:v", "vbr", "-cq:v", qv]
-    elif GPU_ENCODER == "h264_amf":
-        cmd += ["-c:v", "h264_amf", "-quality", "speed",
-                "-qp_i", qv, "-qp_p", qv, "-qp_b", qv]
-    elif GPU_ENCODER == "h264_qsv":
-        cmd += ["-c:v", "h264_qsv", "-preset", "faster",
-                "-global_quality", qv]
-    else:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", qv]
-    cmd += ["-c:a", "aac", "-shortest", "-movflags", "+faststart"]
-    cmd += [str(output_path)]
+        cmd += ["-map", "0:v", "-map", "1:a"]
+        cmd += ["-c:v", "copy", "-c:a", "aac"]
 
-    if not FFMPEG_BIN:
-        print("    ERROR: ffmpeg is not installed. Cannot export clips.")
-        print("    Run:  winget install Gyan.FFmpeg")
-        return False
+    # Limit output duration. We include the full first segment (which may start
+    # slightly before start_sec), so extend by offset_in_chunk to preserve the
+    # intended clip end time.
+    cmd += ["-t", f"{duration + offset_in_chunk:.6f}"]
+    # DASH segments carry absolute PTS (e.g. ~1926s). Shift all timestamps so
+    # the first output frame lands at PTS=0 — prevents player stutter on open.
+    cmd += ["-avoid_negative_ts", "make_zero"]
+    cmd += ["-movflags", "+faststart", str(output_path)]
 
     try:
         no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -583,11 +524,9 @@ def export_clip(session_dir, start_sec, duration, output_path, quality="medium")
                                 creationflags=no_window)
         if result.returncode != 0:
             err = result.stderr.decode(errors="replace")
-            # Extract the most useful line from the ffmpeg error output
             error_lines = [l for l in err.splitlines() if "Error" in l or "Invalid" in l or "No such" in l]
             short_err = error_lines[-1] if error_lines else err[-300:]
             print(f"    WARNING: ffmpeg error: {short_err}")
-            # Remove partial output file so next Export attempt won't skip this clip
             try:
                 output_path.unlink(missing_ok=True)
             except Exception:
@@ -894,12 +833,11 @@ def scan_session_groups(session_dir, output_folder):
     return enriched
 
 
-def merge_clips(clip_paths, output_path, quality="medium"):
+def merge_clips(clip_paths, output_path):
     """
     Concatenate a list of MP4 files into one seamless output file.
-    Uses the ffmpeg concat filter (frame-accurate, no PTS drift between clips)
-    with full re-encode. All input clips must have both video and audio streams
-    — export_clip guarantees this by injecting silent audio when needed.
+    Uses the ffmpeg concat demuxer with stream copy — no re-encoding.
+    All input clips must have both video and audio streams.
     Returns True on success, False on failure.
     """
     if not FFMPEG_BIN:
@@ -911,28 +849,24 @@ def merge_clips(clip_paths, output_path, quality="medium"):
         print("  WARNING: merge requires at least 2 clips.")
         return False
 
+    import tempfile
+    list_fd, list_path = tempfile.mkstemp(suffix=".txt", prefix="steamhl_concat_")
     try:
         no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-        cmd = [FFMPEG_BIN, "-y"]
-        for p in clip_paths:
-            cmd += ["-i", str(p)]
+        # Write the concat list file (paths must use forward slashes or be escaped)
+        with os.fdopen(list_fd, "w", encoding="utf-8") as f:
+            for p in clip_paths:
+                safe = str(p).replace("\\", "/").replace("'", "\\'")
+                f.write(f"file '{safe}'\n")
 
-        streams = "".join(f"[{i}:v][{i}:a]" for i in range(n))
-        # Pipe concat audio through aformat to normalise sample rate/layout
-        # before AAC encoding — mixed rates (e.g. 44100 vs 48000) cause -22.
-        filter_complex = (
-            f"{streams}concat=n={n}:v=1:a=1[v][a_raw];"
-            f"[a_raw]aformat=sample_rates=48000:channel_layouts=stereo:sample_fmts=fltp[a]"
-        )
-        cmd += ["-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]"]
-
-        # Always use libx264 for merge — GPU encoders (QSV/NVENC/AMF) require
-        # hardware surface input and can't directly consume a software concat
-        # filter graph, causing "Invalid argument" errors on some drivers.
-        qv = str(QUALITY_CRF.get(quality, 23))
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", qv]
-        cmd += ["-c:a", "aac", "-movflags", "+faststart", str(output_path)]
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
 
         result = subprocess.run(cmd, capture_output=True, timeout=600,
                                 creationflags=no_window)
@@ -950,6 +884,11 @@ def merge_clips(clip_paths, output_path, quality="medium"):
     except (FileNotFoundError, TypeError):
         print("  ERROR: ffmpeg not found.")
         return False
+    finally:
+        try:
+            os.unlink(list_path)
+        except Exception:
+            pass
 
 
 def _group_events_into_segments(events, threshold):
@@ -971,7 +910,7 @@ def _group_events_into_segments(events, threshold):
     return segments
 
 
-def export_single_group(group, stop_event=None, force=False, quality="medium"):
+def export_single_group(group, stop_event=None, force=False):
     """
     Export one enriched group dict produced by scan_session_groups.
 
@@ -1009,7 +948,6 @@ def export_single_group(group, stop_event=None, force=False, quality="medium"):
             group["clip_start"],
             group["clip_duration"],
             out_path,
-            quality=quality,
         ) else False
 
     # Multiple segments — export each to a temp file then merge
@@ -1023,12 +961,12 @@ def export_single_group(group, stop_event=None, force=False, quality="medium"):
             seg_start = max(0.0, seg[0]["time_sec"] - CLIP_PADDING_BEFORE - pre_shift)
             seg_end   = seg[-1]["time_sec"] + CLIP_PADDING_AFTER + pre_shift
             tmp_path  = tmp_dir / f"seg_{i:03d}.mp4"
-            if not export_clip(group["session_dir"], seg_start, seg_end - seg_start, tmp_path, quality=quality):
+            if not export_clip(group["session_dir"], seg_start, seg_end - seg_start, tmp_path):
                 return False
             tmp_clips.append(tmp_path)
 
         print(f"    Jump-cutting {len(tmp_clips)} segments together…")
-        return merge_clips(tmp_clips, out_path, quality=quality)
+        return merge_clips(tmp_clips, out_path)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

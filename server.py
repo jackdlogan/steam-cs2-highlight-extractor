@@ -67,7 +67,6 @@ class ExportRequest(BaseModel):
     config:   Config
     merge:    bool = False
     workers:  int  = 1
-    quality:  str  = "medium"  # "high" | "medium" | "low"
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
@@ -166,7 +165,6 @@ def get_status():
         "ok":           True,
         "ffmpeg_path":  core.FFMPEG_BIN,
         "ffmpeg_found": bool(core.FFMPEG_BIN),
-        "gpu_encoder":  core.GPU_ENCODER,
     }
 
 
@@ -297,7 +295,7 @@ def export_groups(req: ExportRequest):
                        "tag": group.get("tag", ""), "duration": group.get("clip_duration", 0)})
                 t0 = time.time()
                 try:
-                    result = core.export_single_group(group, stop_event=_stop_event, force=do_merge, quality=req.quality)
+                    result = core.export_single_group(group, stop_event=_stop_event, force=do_merge)
                 except Exception as exc:
                     return i, group, safe_name, False, round(time.time() - t0, 1), str(exc)
                 return i, group, safe_name, result, round(time.time() - t0, 1), None
@@ -366,7 +364,7 @@ def export_groups(req: ExportRequest):
                 q.put({"type": "log",
                        "text":  f"\n  Merging {len(exported_paths)} clips into {merged_name}…\n",
                        "level": "info"})
-                ok = core.merge_clips(exported_paths, merged_path, quality=req.quality)
+                ok = core.merge_clips(exported_paths, merged_path)
                 if ok and merged_path.exists():
                     size_mb = merged_path.stat().st_size / 1_000_000
                     q.put({"type": "log",
