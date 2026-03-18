@@ -57,7 +57,7 @@
   let extractKills  = true
   let extractDeaths = false
   let doMerge       = false
-  let workers       = 1
+  let workers       = 4
   let lastApplied   = null   // config snapshot from last scan
 
   // ── Sessions ───────────────────────────────────────────────────────
